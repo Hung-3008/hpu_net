@@ -1,80 +1,93 @@
+from typing import Optional, Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ResBlock(nn.Module):
-    """
-    A pre-activated residual block.
 
-    This block applies an activation to the input, passes it through a series
-    of convolutional layers (using kernel size 3 with padding to preserve spatial dimensions),
-    and then adds a skip connection. If the input number of channels differs from the desired
-    output channels, a 1x1 convolution is applied to the skip. Similarly, if the intermediate
-    (down) channels differ from the output channels, a 1x1 convolution is applied to the residual.
+def res_block(input_features: torch.Tensor,
+              n_channels: int,
+              n_down_channels: Optional[int] = None,
+              activation_fn: Callable = F.relu,
+              convs_per_block: int = 3) -> torch.Tensor:
+    """A pre-activated residual block.
 
     Args:
-      in_channels: Number of input channels.
-      out_channels: Desired number of output channels.
-      mid_channels: Number of intermediate channels; if None, set to out_channels.
-      convs_per_block: Number of convolutional layers in the block.
-      activation_fn: Activation function to use (default: F.relu).
-    """
-    def __init__(self, in_channels, out_channels, mid_channels=None, convs_per_block=3, activation_fn=F.relu):
-        super(ResBlock, self).__init__()
-        if mid_channels is None:
-            mid_channels = out_channels
-        self.activation_fn = activation_fn
-
-        # First convolution: in_channels -> mid_channels, then convs_per_block-1 convs: mid_channels -> mid_channels.
-        self.convs = nn.ModuleList()
-        self.convs.append(nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1))
-        for _ in range(1, convs_per_block):
-            self.convs.append(nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1))
-
-        # If the input channel count differs from out_channels, adjust the skip connection.
-        self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
-        # If the intermediate channel count differs from out_channels, adjust the residual.
-        self.res_conv = nn.Conv2d(mid_channels, out_channels, kernel_size=1) if mid_channels != out_channels else None
-
-    def forward(self, x):
-        skip = x
-        out = self.activation_fn(x)
-        for i, conv in enumerate(self.convs):
-            out = conv(out)
-            if i < len(self.convs) - 1:
-                out = self.activation_fn(out)
-        if self.res_conv is not None:
-            out = self.res_conv(out)
-        if self.skip_conv is not None:
-            skip = self.skip_conv(skip)
-        return skip + out
-
-
-def resize_up(input_features, scale=2):
-    """
-    Nearest neighbor upsampling operation.
-
-    Args:
-      input_features: A tensor of shape (B, C, H, W).
-      scale: Upsampling factor.
+        input_features: A tensor of shape (b, c, h, w)
+        n_channels: Number of output channels
+        n_down_channels: Number of intermediate channels
+        activation_fn: Callable activation function
+        convs_per_block: Number of convolutional layers
     Returns:
-      A tensor of shape (B, C, scale * H, scale * W).
+        A tensor of shape (b, c, h, w)
     """
-    assert scale >= 1, "Scale must be >= 1"
-    # For nearest neighbor, F.interpolate is equivalent to tf.image.resize(..., method='NEAREST_NEIGHBOR').
-    return F.interpolate(input_features, scale_factor=scale, mode='nearest')
+    # Pre-activate the inputs
+    skip = input_features
+    residual = activation_fn(input_features)
+
+    # Set the number of intermediate channels that we compress to
+    if n_down_channels is None:
+        n_down_channels = n_channels
+
+    for c in range(convs_per_block):
+        residual = nn.Conv2d(
+            in_channels=residual.size(1),
+            out_channels=n_down_channels,
+            kernel_size=3,
+            padding=1,
+            bias=True)(residual)
+        if c < convs_per_block - 1:
+            residual = activation_fn(residual)
+
+    incoming_channels = input_features.size(1)
+    if incoming_channels != n_channels:
+        skip = nn.Conv2d(
+            in_channels=incoming_channels,
+            out_channels=n_channels,
+            kernel_size=1,
+            padding=0,
+            bias=True)(skip)
+    if n_down_channels != n_channels:
+        residual = nn.Conv2d(
+            in_channels=n_down_channels,
+            out_channels=n_channels,
+            kernel_size=1,
+            padding=0,
+            bias=True)(residual)
+    return skip + residual
 
 
-def resize_down(input_features, scale=2):
-    """
-    Downsampling operation via average pooling.
+def resize_up(input_features: torch.Tensor, scale: int = 2) -> torch.Tensor:
+    """Nearest neighbor rescaling-operation for the input features.
 
     Args:
-      input_features: A tensor of shape (B, C, H, W).
-      scale: Downsampling factor.
+        input_features: A tensor of shape (b, c, h, w)
+        scale: Scaling factor
     Returns:
-      A tensor of shape (B, C, H/scale, W/scale).
+        A tensor of shape (b, c, scale * h, scale * w)
     """
-    assert scale >= 1, "Scale must be >= 1"
-    # F.avg_pool2d with kernel_size and stride equal to scale mimics tf.nn.avg_pool2d with ksize (1, scale, scale, 1).
-    return F.avg_pool2d(input_features, kernel_size=scale, stride=scale)
+    assert scale >= 1
+    _, _, size_x, size_y = input_features.shape
+    new_size_x = int(round(size_x * scale))
+    new_size_y = int(round(size_y * scale))
+    return F.interpolate(
+        input_features,
+        size=(new_size_x, new_size_y),
+        mode='nearest',
+        align_corners=None)
+
+
+def resize_down(input_features: torch.Tensor, scale: int = 2) -> torch.Tensor:
+    """Average pooling rescaling-operation for the input features.
+
+    Args:
+        input_features: A tensor of shape (b, c, h, w)
+        scale: Scaling factor
+    Returns:
+        A tensor of shape (b, c, h / scale, w / scale)
+    """
+    assert scale >= 1
+    return F.avg_pool2d(
+        input_features,
+        kernel_size=scale,
+        stride=scale,
+        padding=0)
