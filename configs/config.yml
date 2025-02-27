@@ -5,7 +5,7 @@ data:
   val_file: "datasets/ACDC/lists_ACDC/valid.txt"
   val_size: null  # If null, the whole validation set will be used
   val_period: 100
-  val_bs: 8
+  val_bs: 16
   normalization: "standard"
   random_seed: 0
 
@@ -43,7 +43,7 @@ loss:
 
 # Training Configuration
 training:
-  epochs: 300
+  epochs: 200
   bs: 32
   optimizer: "adam"
   wd: 0.0
