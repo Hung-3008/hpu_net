@@ -1,410 +1,475 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Normal, Independent
+import torch.optim as optim
+from torch.nn import MSELoss
 
-def resize_down(x, scale=2):
-    return F.avg_pool2d(x, kernel_size=scale, stride=scale)
 
-def resize_up(x, scale=2):
-    return F.interpolate(x, scale_factor=scale, mode='nearest')
-
-# ------------------------------
-# Pre-allocated ResidualBlock Module
-# ------------------------------
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, intermediate_channels=None, convs_per_block=3, activation_fn=F.relu):
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, activation="ReLU", kernel_size=3, dilation=1, padding_mode='circular', conv_class=nn.Conv2d):
         super().__init__()
-        if intermediate_channels is None:
-            intermediate_channels = out_channels
-        layers = []
-        layers.append(nn.Conv2d(in_channels, intermediate_channels, kernel_size=3, padding=1))
-        layers.append(nn.ReLU(inplace=True))
-        for i in range(convs_per_block - 1):
-            layers.append(nn.Conv2d(intermediate_channels, intermediate_channels, kernel_size=3, padding=1))
-            if i < convs_per_block - 2:
-                layers.append(nn.ReLU(inplace=True))
-        self.conv = nn.Sequential(*layers)
-        self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
-        self.out_conv = nn.Conv2d(intermediate_channels, out_channels, kernel_size=1) if intermediate_channels != out_channels else nn.Identity()
-        self.activation_fn = activation_fn
+        self.conv1 = conv_class(in_channels=in_ch, out_channels=out_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
+        self.conv2 = conv_class(in_channels=out_ch, out_channels=out_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
+
+        if activation.lower() == "relu":
+            self.activation = nn.ReLU()
+        elif activation.lower() == "elu":
+            self.activation = nn.ELU()
+        elif activation.lower() == "leakyrelu":
+            self.activation = nn.LeakyReLU()
 
     def forward(self, x):
-        skip = self.skip_conv(x)
-        out = self.activation_fn(x)
-        out = self.conv(out)
-        out = self.out_conv(out)
-        return out + skip
+        f = self.activation(self.conv1(x))
+        f = self.activation(self.conv2(f))
 
-# ------------------------------
-# HierarchicalCore Module with Pre-allocated Layers
-# ------------------------------
-class HierarchicalCore(nn.Module):
-    def __init__(self, latent_dims, channels_per_block, down_channels_per_block=None,
-                 activation_fn=F.relu, convs_per_block=3, blocks_per_level=3, in_channels=1):
-        """
-        channels_per_block: list of length L (e.g., [5,7,9,11,13])
-        latent_dims: list of length M (e.g., [3,2,1])
-        """
+        return f
+
+
+class PreResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch=None, activation="ReLU", kernel_size=3, dilation=1, padding_mode='circular', conv_class=nn.Conv2d):
         super().__init__()
-        self.latent_dims = latent_dims
-        self.channels_per_block = channels_per_block
-        self.down_channels_per_block = down_channels_per_block if down_channels_per_block is not None else channels_per_block
-        self.activation_fn = activation_fn
-        self.convs_per_block = convs_per_block
-        self.blocks_per_level = blocks_per_level
-        self.num_levels = len(channels_per_block)
-        self.num_latent_levels = len(latent_dims)
         
-        # Encoder
-        self.input_conv = nn.Conv2d(in_channels, channels_per_block[0], kernel_size=3, padding=1)
-        self.encoder_blocks = nn.ModuleList()
-        self.downsamplers = nn.ModuleList()
-        for i in range(self.num_levels):
-            block_layers = []
-            # For level 0, input is already mapped to channels_per_block[0]
-            if i > 0:
-                # Transition convolution: map from previous level's channels to current
-                block_layers.append(nn.Conv2d(channels_per_block[i-1], channels_per_block[i], kernel_size=3, padding=1))
-            for _ in range(blocks_per_level):
-                block_layers.append(ResidualBlock(channels_per_block[i], channels_per_block[i],
-                                                  intermediate_channels=self.down_channels_per_block[i],
-                                                  convs_per_block=convs_per_block, activation_fn=activation_fn))
-            self.encoder_blocks.append(nn.Sequential(*block_layers))
-            if i < self.num_levels - 1:
-                self.downsamplers.append(nn.AvgPool2d(2))
+        if out_ch is None:
+            out_ch = in_ch
+            self.skipconv = nn.Identity()
+        else:
+            self.skipconv = conv_class(in_channels=in_ch, out_channels=out_ch, kernel_size=1)
+
+        if activation.lower() == "relu":
+            self.activation = nn.ReLU()
+        elif activation.lower() == "elu":
+            self.activation = nn.ELU()
+        elif activation.lower() == "leakyrelu":
+            self.activation = nn.LeakyReLU()
+
+        med_ch = in_ch//2 if in_ch > 1 else 1
+
+        self.bn1 = nn.BatchNorm2d(num_features=in_ch) if conv_class == nn.Conv2d else nn.BatchNorm1d(num_features=in_ch)
+        self.bn2 = nn.BatchNorm2d(num_features=med_ch) if conv_class == nn.Conv2d else nn.BatchNorm1d(num_features=med_ch)
+        self.conv1 = conv_class(in_channels=in_ch, out_channels=med_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
+        self.conv2 = conv_class(in_channels=med_ch, out_channels=med_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
+        self.outconv = conv_class(in_channels=med_ch, out_channels=out_ch, kernel_size=1)
+
+    def forward(self, x):
+        f = self.conv1(self.activation(self.bn1(x)))
+        f = self.conv2(self.activation(self.bn2(f)))
+        f = self.outconv(f)
+
+        return f + self.skipconv(x)
+
+
+class ScaleBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, activation="ReLU", scale_depth=1, kernel_size=3, dilation=1, padding_mode='circular', conv_class=nn.Conv2d):
+        super().__init__()
         
-        # Decoder
-        self.latent_conv = nn.ModuleList() 
-        self.decoder_refinement = nn.ModuleList()
-        current_ch = self.channels_per_block[-1]  # from deepest encoder (level L-1)
-        for i in range(self.num_latent_levels):
-            ld = latent_dims[i]
-            self.latent_conv.append(nn.Conv2d(current_ch, 2 * ld, kernel_size=1, padding=0))
-            injected_ch = current_ch + ld
-            skip_ch = self.channels_per_block[self.num_levels - 1 - (i+1)]
-            total_ch = injected_ch + skip_ch
-            blocks = []
-            blocks.append(ResidualBlock(
-                total_ch,
-                skip_ch,
-                intermediate_channels=self.down_channels_per_block[::-1][i+1],
-                convs_per_block=convs_per_block,
-                activation_fn=activation_fn
-            ))
-            for _ in range(blocks_per_level - 1):
-                blocks.append(ResidualBlock(
-                    skip_ch,
-                    skip_ch,
-                    intermediate_channels=self.down_channels_per_block[::-1][i+1],
-                    convs_per_block=convs_per_block,
-                    activation_fn=activation_fn
-                ))
-            self.decoder_refinement.append(nn.Sequential(*blocks))
-            current_ch = skip_ch
+        self.first_preres_blocks = nn.ModuleList( [ PreResBlock(in_ch, None, activation, kernel_size, dilation, padding_mode=padding_mode, conv_class=conv_class) for _ in range(scale_depth-1) ] )
+        self.last_preres_block = PreResBlock(in_ch, out_ch, activation, kernel_size, dilation, padding_mode=padding_mode, conv_class=conv_class)
 
-    def forward(self, inputs, mean=False, z_q=None):
-        # Encoder forward
-        x = self.input_conv(inputs)
-        encoder_outputs = []
-        for i in range(self.num_levels):
-            x = self.encoder_blocks[i](x)
-            encoder_outputs.append(x)
-            if i < self.num_levels - 1:
-                x = self.downsamplers[i](x)
-        # Decoder forward: start with deepest encoder output.
-        decoder_features = encoder_outputs[-1]
-        distributions = []
-        used_latents = []
-        for i in range(self.num_latent_levels):
-            conv1x1 = self.latent_conv[i]
-            mu_logsigma = conv1x1(decoder_features)
-            ld = self.latent_dims[i]
-            mu = mu_logsigma[:, :ld, :, :]
-            logsigma = mu_logsigma[:, ld:, :, :]
-            dist = Independent(Normal(mu, torch.exp(logsigma)), 1)
-            distributions.append(dist)
-            if z_q is not None:
-                z = z_q[i]
-            elif isinstance(mean, bool) and mean:
-                z = mu
-            elif isinstance(mean, list) and mean[i]:
-                z = mu
-            else:
-                z = dist.rsample()
-            used_latents.append(z)
-            # Concatenate latent and current features.
-            decoder_features = torch.cat([z, decoder_features], dim=1)
-            decoder_features = resize_up(decoder_features, scale=2)
-            # Get corresponding skip connection (from reversed encoder outputs)
-            skip_feat = encoder_outputs[::-1][i+1]
-            # Ensure spatial sizes match:
-            if decoder_features.shape[2:] != skip_feat.shape[2:]:
-                skip_feat = F.interpolate(skip_feat, size=decoder_features.shape[2:], mode='nearest')
-            decoder_features = torch.cat([decoder_features, skip_feat], dim=1)
-            decoder_features = self.decoder_refinement[i](decoder_features)
-        return {'decoder_features': decoder_features,
-                'encoder_features': encoder_outputs,
-                'distributions': distributions,
-                'used_latents': used_latents}
+    def forward(self, x):
+        f = x
+        if len(self.first_preres_blocks) > 0:
+            for block in self.first_preres_blocks:
+                f = block(f)
+        f = self.last_preres_block(f)
+
+        return f
 
 
-# ------------------------------
-# StitchingDecoder Module with Pre-allocated Layers - FIXED VERSION
-# ------------------------------
-class StitchingDecoder(nn.Module):
-    """
-    A module that completes the truncated U-Net decoder.
+class Encoder(nn.Module):
+    def __init__(self, chs, activation="ReLU", scale_depth=1, kernel_size=None, dilation=None, padding_mode='circular', conv_class=nn.Conv2d):
+        super().__init__()
+        self.downsampling = nn.AvgPool2d(kernel_size=2) if conv_class == nn.Conv2d else nn.AvgPool1d(kernel_size=2)
+        self.encoder_blocks = nn.ModuleList( [ ScaleBlock(chs[i], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) for i in range(len(chs)-1) ] )
+
+    def forward(self, x):
+        encoder_feature_maps = [x]
+        f = x
+        for block in self.encoder_blocks:
+            f = self.downsampling(f)
+            f = block(f)
+            encoder_feature_maps.append(f)
+
+        encoder_feature_maps.reverse()
+        return encoder_feature_maps
+
+
+class Decoder(nn.Module):
+    def __init__(self, chs, latent_num=0, activation="ReLU", scale_depth=1, kernel_size=None, dilation=None, padding_mode='circular', latent_channels=None, latent_locks=None, conv_class=nn.Conv2d):
+        super().__init__()
+        self.depth = len(chs) - 1
+        self.latent_num = latent_num
+        self.latent_channels = latent_channels
+        self.latent_locks = latent_locks
+
+        self.upsampling = nn.Upsample(scale_factor=2, mode='nearest')
+
+        # Prior Net
+        self.latent_mean_convs = nn.ModuleList(
+            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ] 
+        )
+
+        self.latent_std_convs = nn.ModuleList(
+            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ]
+        )
+        self.decoder_blocks = nn.ModuleList(
+            [ ScaleBlock(chs[i] + chs[i+1] + latent_channels[i], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) if i < latent_num
+            else ScaleBlock(chs[i] + chs[i+1], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) for i in range(self.depth) ]
+        )
+
+        # Posterior Net
+        self.post_latent_mean_convs = nn.ModuleList(
+            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ]
+        )
+        self.post_latent_std_convs = nn.ModuleList(
+            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ]
+        )
+        self.post_decoder_blocks = nn.ModuleList(
+            [ ScaleBlock(chs[i] + chs[i+1] + latent_channels[i], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) for i in range(latent_num - 1) ]
+        )
+
+
+    def sample_latent(self, means, log_stds, latent_lock):
+        if latent_lock is True:
+            latent = means
+        else:
+            rands = torch.normal( mean=torch.zeros_like(means), std=torch.ones_like(log_stds) )
+            latent = rands * torch.exp(log_stds) + means
+
+        return latent
     
-    Using the output of the HierarchicalCore (i.e. the encoder outputs and the truncated decoder features),
-    this module upsamples and concatenates skip connections to form a full symmetric U-Net, outputting
-    segmentation logits.
-    """
-    def __init__(self, latent_dims, channels_per_block, num_classes,
-                 down_channels_per_block=None, activation_fn=F.relu,
-                 convs_per_block=3, blocks_per_level=3):
-        super().__init__()
-        self.latent_dims = latent_dims
-        self.channels_per_block = channels_per_block
-        self.num_classes = num_classes
-        self.activation_fn = activation_fn
-        self.convs_per_block = convs_per_block
-        self.blocks_per_level = blocks_per_level
-        self.down_channels_per_block = down_channels_per_block if down_channels_per_block is not None else channels_per_block
-        
-        self.num_levels = len(channels_per_block)
-        self.num_latents = len(latent_dims)
-        self.start_level = self.num_latents + 1
-        
-        # Pre-allocate transition convs and refinement blocks for remaining levels
-        self.decoder_blocks = nn.ModuleList()
-        self.transition_convs = nn.ModuleList()
-        rev_channels = list(reversed(channels_per_block))
-        
-        for level in range(self.start_level, self.num_levels):
-            # Current features channel count
-            curr_ch = rev_channels[level - 1]  # Previous level's channels
-            # Skip connection channel count
-            skip_ch = rev_channels[level]
-            # After concatenation, total channels
-            total_ch = curr_ch + skip_ch
-            
-            # Transition conv to reduce channels after concatenation
-            self.transition_convs.append(nn.Conv2d(total_ch, skip_ch, kernel_size=3, padding=1))
-            
-            # Refinement blocks
-            blocks = []
-            for _ in range(blocks_per_level):
-                blocks.append(ResidualBlock(
-                    skip_ch, skip_ch,
-                    intermediate_channels=self.down_channels_per_block[::-1][level],
-                    convs_per_block=convs_per_block,
-                    activation_fn=activation_fn
-                ))
-            self.decoder_blocks.append(nn.Sequential(*blocks))
-            
-        self.final_conv = nn.Conv2d(rev_channels[-1], num_classes, kernel_size=1, padding=0)
 
-    def forward(self, encoder_features, decoder_features):
-        # Reverse the encoder outputs (so that index 0 corresponds to the deepest encoder output)
-        encoder_features_reversed = encoder_features[::-1]
-        
-        # Loop over levels from start_level to num_levels-1
-        for level in range(self.start_level, self.num_levels):
-            # Upscale decoder features
-            decoder_features = resize_up(decoder_features, scale=2)
-            
-            # Get skip connection from encoder
-            skip_connection = encoder_features_reversed[level]
-            
-            # Ensure spatial dimensions match
-            if decoder_features.shape[2:] != skip_connection.shape[2:]:
-                skip_connection = F.interpolate(skip_connection, 
-                                               size=decoder_features.shape[2:], 
-                                               mode='nearest')
-            
-            # Concatenate upscaled features with skip connection
-            decoder_features = torch.cat([decoder_features, skip_connection], dim=1)
-            
-            # Apply transition conv to reduce channels
-            decoder_features = self.transition_convs[level - self.start_level](decoder_features)
-            
-            # Apply refinement blocks
-            decoder_features = self.decoder_blocks[level - self.start_level](decoder_features)
-            
-        # Final 1x1 conv to get logits
-        logits = self.final_conv(decoder_features)
-        return logits
+    def forward(self, feature_maps, post_feature_maps=None, insert_from_postnet=False):
+        if post_feature_maps is None:  # Not Using Posterior Net
+            prior_means, prior_stds = [], []
+            prior_latents = []
+            f = feature_maps[0]
+            for i in range(self.depth):
+                if i < self.latent_num:
+                    means, log_stds = self.latent_mean_convs[i](f), self.latent_std_convs[i](f)
+                    prior_means.append(means)
+                    prior_stds.append(torch.exp(log_stds))
+
+                    latent = self.sample_latent(means, log_stds, self.latent_locks[i])
+                    prior_latents.append(latent)
+
+                    f = torch.cat([f, latent], dim=1)
+
+                f = self.upsampling(f)
+
+                f = torch.cat([ f, feature_maps[i+1] ], dim=1)
+                f = self.decoder_blocks[i](f)
+
+            if self.latent_num == self.depth + 1:
+                means, log_stds = self.latent_mean_convs[self.depth](f), self.latent_std_convs[self.depth](f)
+                latent = self.sample_latent(means, log_stds, self.latent_locks[self.depth])
+
+                f = torch.cat([f, latent], dim=1)
 
 
-# ------------------------------
-# GECO Utilities
-# ------------------------------
-class MovingAverage(nn.Module):
-    def __init__(self, decay=0.99, differentiable=True):
-        super().__init__()
-        self.decay = decay
-        self.value = None
-
-    def forward(self, x):
-        if self.value is None:
-            self.value = x.detach()
-        else:
-            self.value = self.decay * self.value + (1 - self.decay) * x.detach()
-        return self.value
-
-class LagrangeMultiplier(nn.Module):
-    def __init__(self, rate=1e-2):
-        super().__init__()
-        self.rate = rate
-        self.multiplier = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, constraint):
-        return self.multiplier
-
-# ------------------------------
-# HierarchicalProbUNet Module using Pre-allocated Submodules
-# ------------------------------
-class HierarchicalProbUNet(nn.Module):
-    def __init__(self,
-                 latent_dims=(1, 1, 1, 1),
-                 channels_per_block=None,
-                 num_classes=4,  # For ACDC: background, LV, RV, Myo
-                 down_channels_per_block=None,
-                 activation_fn=F.relu,
-                 convs_per_block=3,
-                 blocks_per_level=3,
-                 loss_kwargs=None,
-                 name='HPUNet',
-                 in_channels=1):
-        super().__init__()
-        base_channels = 24
-        default_channels_per_block = (
-            base_channels, 2 * base_channels, 4 * base_channels, 8 * base_channels,
-            8 * base_channels, 8 * base_channels, 8 * base_channels,
-            8 * base_channels
-        )
-        if channels_per_block is None:
-            channels_per_block = default_channels_per_block
-        if down_channels_per_block is None:
-            down_channels_per_block = tuple(i // 2 for i in default_channels_per_block)
-        
-        if loss_kwargs is None:
-            self._loss_kwargs = {
-                'type': 'geco',
-                'top_k_percentage': 0.02,
-                'deterministic_top_k': False,
-                'kappa': 0.05,
-                'decay': 0.99,
-                'rate': 1e-2,
-                'beta': 1.0
+            # Items to return as well as the network's output
+            infodict = {
+                'prior_latents': prior_latents,
+                'prior_means': prior_means,
+                'prior_stds': prior_stds
             }
+
+            return f, infodict
+        
+        
+        else:  # Using Posterior Net
+            post_means, post_stds = [], []
+            post_latents = []
+            l = post_feature_maps[0]
+            for i in range(self.latent_num):
+                means, log_stds = self.post_latent_mean_convs[i](l), self.post_latent_std_convs[i](l)
+                post_means.append(means)
+                post_stds.append(torch.exp(log_stds))
+                
+                post_latent = self.sample_latent(means, log_stds, self.latent_locks[i])
+
+                post_latents.append(post_latent)
+
+                if i < self.latent_num - 1:
+                    l = torch.cat([l, post_latent], dim=1)
+                    l = self.upsampling(l)
+
+                    l = torch.cat([ l, post_feature_maps[i+1] ], dim=1)
+                    l = self.post_decoder_blocks[i](l)
+
+            prior_means, prior_stds = [], []
+            prior_latents = []
+            f = feature_maps[0]
+            for i in range(self.depth):
+                if i < self.latent_num:
+                    means, log_stds = self.latent_mean_convs[i](f), self.latent_std_convs[i](f)
+                    prior_means.append(means)
+                    prior_stds.append(torch.exp(log_stds))
+                    
+                    if (self.training is True and self.latent_locks[i] is False) or (insert_from_postnet is True):  # Insert Latents from Posterior Net
+                        latent = post_latents[i]
+                    else:  # Insert Latents from Prior Net
+                        latent = self.sample_latent(means, log_stds, self.latent_locks[i])
+
+                    prior_latents.append(latent)
+
+                    f = torch.cat([f, latent], dim=1)
+
+                f = self.upsampling(f)
+
+                f = torch.cat([ f, feature_maps[i+1] ], dim=1)
+                f = self.decoder_blocks[i](f)
+            
+            if self.latent_num == self.depth + 1:
+                means, log_stds = self.latent_mean_convs[self.depth](f), self.latent_std_convs[self.depth](f)
+                prior_means.append(means)
+                prior_stds.append(torch.exp(log_stds))
+                
+                if (self.training is True and self.latent_locks[self.depth] is False) or (insert_from_postnet is True):  # Insert Latents from Posterior Net
+                    latent = post_latents[self.depth]
+                else:  # Insert Latents from Prior Net
+                    latent = self.sample_latent(means, log_stds, self.latent_locks[self.depth])
+
+                prior_latents.append(latent)
+
+                f = torch.cat([f, latent], dim=1)
+
+
+            # Calculate kl divergence between posterior net and prior net latents
+            kls = torch.zeros(self.latent_num, device=f.device) if self.latent_num > 0 else torch.zeros(1, device=f.device)  # next(self.parameters()).device
+
+            for i in range(self.latent_num):
+                if self.latent_locks[i] is False:
+                    kl = torch.log( prior_stds[i] / post_stds[i] )                             \
+                        + (    post_stds[i] ** 2  +  (post_means[i] - prior_means[i]) ** 2)     \
+                            / 2 / prior_stds[i] ** 2                                         \
+                        - 1 / 2
+                    
+                    kls[i] = kl.reshape(feature_maps[0].shape[0],-1).sum(dim=1).mean()
+
+            
+            # Items to return as well as the network's output
+            infodict = {
+                'kls': kls,
+                'post_latents': post_latents,
+                'prior_latents': prior_latents,
+                'post_means': post_means,
+                'post_stds': post_stds,
+                'prior_means': prior_means,
+                'prior_stds': prior_stds
+            }
+       
+            return f, infodict
+
+
+class HPUNet(nn.Module):
+    def __init__(self, in_ch, chs, latent_num=0, out_ch=1, activation="ReLU", scale_depth=None, kernel_size=None, dilation=None, padding_mode='circular', latent_channels=None, latent_locks=None, conv_dim=2):
+        super().__init__()
+        if latent_locks is None:
+            latent_locks = [False for _ in range(latent_num)]
+        if latent_channels is None:
+            latent_channels = [1 for _ in range(latent_num)]
+        assert len(latent_channels) == latent_num
+        assert latent_num <= len(chs)
+        assert len(scale_depth) == len(chs)
+        assert len(kernel_size) == len(chs)
+        assert len(dilation) == len(chs)
+
+        self.conv_dim = conv_dim
+        self.conv_class = nn.Conv2d if self.conv_dim == 2 else nn.Conv1d
+        decoder_head_in_channels = chs[0] + (0 if latent_num < len(chs) else latent_channels[-1])
+
+        self.encoder_head = ConvBlock(in_ch, chs[0], activation, kernel_size[0], dilation[0], padding_mode='zeros', conv_class=self.conv_class)
+        self.encoder = Encoder(chs, activation, scale_depth, kernel_size, dilation, padding_mode='zeros', conv_class=self.conv_class)
+        self.decoder = Decoder(list(reversed(chs)), latent_num, activation, list(reversed(scale_depth)), list(reversed(kernel_size)), list(reversed(dilation)), padding_mode=padding_mode, latent_channels=latent_channels, latent_locks=latent_locks, conv_class=self.conv_class)
+        self.decoder_head = ScaleBlock(decoder_head_in_channels, out_ch, activation, scale_depth[0], kernel_size[0], dilation[0], padding_mode=padding_mode, conv_class=self.conv_class)
+
+        self.posterior_encoder_head = ConvBlock(in_ch+1, chs[0], activation, kernel_size[0], dilation[0], padding_mode='zeros', conv_class=self.conv_class)
+        self.posterior_encoder = Encoder(chs, activation, scale_depth, kernel_size, dilation, padding_mode='zeros', conv_class=self.conv_class)
+
+    def forward(self, x, y=None, times=1, first_channel_only=True, insert_from_postnet=False):
+        f = self.encoder_head(x)
+        f = self.encoder(f)
+        
+        outs, infodicts = [], []
+
+        if y is None:  # Not Using Posterior Net
+            for _ in range(times):
+                o, infodict = self.decoder(f)
+                o = self.decoder_head(o)
+                outs.append(o)
+                infodicts.append(infodict)
+
+        else:  # Using Posterior Net
+            l = self.posterior_encoder_head(torch.cat([x, y], dim=1))
+            l = self.posterior_encoder(l)
+
+            for _ in range(times):
+                o, infodict = self.decoder(f, l, insert_from_postnet)
+                o = self.decoder_head(o)
+                outs.append(o)
+                infodicts.append(infodict)
+
+        output = torch.stack(outs, dim=1)
+
+        if first_channel_only is True:
+            output = output[:,:,0]
+
+        return output, infodicts
+
+
+# Optimization
+class BetaConstant(nn.Module):
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+
+    def step(self):
+        return
+
+
+class BetaLinearScheduler(nn.Module):
+    def __init__(self, ascending_steps, constant_steps=0, max_beta=1.0, saturation_step=None):
+        super().__init__()
+        self.ascending_steps = ascending_steps
+        self.constant_steps = constant_steps
+        self.max_beta = max_beta
+        if saturation_step is not None:
+            self.saturation_gap = saturation_step
         else:
-            self._loss_kwargs = loss_kwargs
+            self.saturation_gap = -1
 
-        # Prior network: input is image only.
-        self.prior = HierarchicalCore(
-            latent_dims=latent_dims,
-            channels_per_block=channels_per_block,
-            down_channels_per_block=down_channels_per_block,
-            activation_fn=activation_fn,
-            convs_per_block=convs_per_block,
-            blocks_per_level=blocks_per_level,
-            in_channels=in_channels
-        )
-        # Posterior network: input is image concatenated with segmentation (in one-hot, so channels = in_channels+num_classes)
-        self.posterior = HierarchicalCore(
-            latent_dims=latent_dims,
-            channels_per_block=channels_per_block,
-            down_channels_per_block=down_channels_per_block,
-            activation_fn=activation_fn,
-            convs_per_block=convs_per_block,
-            blocks_per_level=blocks_per_level,
-            in_channels=in_channels + num_classes
-        )
-        self.f_comb = StitchingDecoder(
-            latent_dims=latent_dims,
-            channels_per_block=channels_per_block,
-            num_classes=num_classes,
-            down_channels_per_block=down_channels_per_block,
-            activation_fn=activation_fn,
-            convs_per_block=convs_per_block,
-            blocks_per_level=blocks_per_level
-        )
-        if self._loss_kwargs['type'] == 'geco':
-            self._moving_average = MovingAverage(decay=self._loss_kwargs['decay'], differentiable=True)
-            self._lagmul = LagrangeMultiplier(rate=self._loss_kwargs['rate'])
-        self._cache = None
+        self.increment = max_beta / ascending_steps
 
-    def _build(self, seg, img):
-        # If seg is (B, H, W), convert to one-hot: (B, num_classes, H, W)
-        if seg.dim() == 3:
-            seg = F.one_hot(seg, num_classes=self.f_comb.num_classes).permute(0, 3, 1, 2).float()
-        x = torch.cat([seg, img], dim=1)
-        self._q_sample = self.posterior(x, mean=False)
-        self._q_sample_mean = self.posterior(x, mean=True)
-        self._p_sample = self.prior(img, mean=False, z_q=None)
-        self._p_sample_z_q = self.prior(img, mean=False, z_q=self._q_sample['used_latents'])
-        self._p_sample_z_q_mean = self.prior(img, mean=False, z_q=self._q_sample_mean['used_latents'])
+        self.beta = 0.0
+        self.state = 'ascend'
+        self.s = 0
 
-    def sample(self, img, mean=False, z_q=None):
-        prior_out = self.prior(img, mean, z_q)
-        encoder_features = prior_out['encoder_features']
-        decoder_features = prior_out['decoder_features']
-        return self.f_comb(encoder_features, decoder_features)
+    def step(self):
+        if self.state == 'ascend':
+            self.beta += self.increment
+            self.s += 1
+            if self.s == self.ascending_steps:
+                self.state = 'constant'
+                self.s = 0
+        
+        elif self.state == 'constant':
+            self.s += 1
+            if self.s == self.constant_steps:
+                self.state = 'ascend'
+                self.s = 0
+                self.beta = 0.0
+        
+        self.saturation_gap -= 1
+        if self.saturation_gap == 0:
+            self.state = 'saturated'
+            self.beta = self.max_beta
 
-    def reconstruct(self, seg, img, mean=False):
-        self._build(seg, img)
-        if mean:
-            prior_out = self._p_sample_z_q_mean
+        return
+
+
+# Loss Functions & Utils
+class MSELossWrapper(MSELoss):
+    def __init__(self):
+        super().__init__(reduction='none')
+        self.last_loss = None
+
+    def forward(self, yhat, y, **kwargs):
+        loss = super().forward(yhat, y)
+
+        self.last_loss = {
+            'expanded_loss': loss
+        }
+
+        return loss
+
+
+class ELBOLoss(nn.Module):
+    def __init__(self, reconstruction_loss, beta=None, conv_dim=2):
+        super().__init__()
+        self.conv_dim = conv_dim
+        self.reconstruction_loss = reconstruction_loss
+        
+        if beta is None:
+            beta = BetaConstant(1.0)
+        self.beta_scheduler = beta
+        
+        self.last_loss = None
+
+ 
+    def forward(self, yhat, y, kls, **kwargs):
+        rec_loss_before_mean = self.reconstruction_loss(yhat, y, **kwargs).sum( dim=tuple(range(1,self.conv_dim)) )
+        rec_term = rec_loss_before_mean.mean()
+        kl_term = self.beta_scheduler.beta * torch.sum(kls)
+        loss = rec_term + kl_term
+
+        self.last_loss = {
+            'reconstruction_loss_before_mean': rec_loss_before_mean,
+            'reconstruction_term': rec_term,
+            'kl_term': kl_term,
+            'loss': loss,
+            'reconstruction_internal': self.reconstruction_loss.last_loss
+        }
+
+        return loss
+
+
+class GECOLoss(nn.Module):
+    def __init__(self, reconstruction_loss, kappa, decay=0.9, update_rate=0.01, device='cpu', log_inv_function='exp', conv_dim=2):
+        super(GECOLoss, self).__init__()
+        self.conv_dim = conv_dim
+        self.reconstruction_loss = reconstruction_loss
+        
+        self.kappa = kappa
+        self.decay = decay
+        self.update_rate = update_rate
+
+        if log_inv_function == 'exp':
+            self.log_inv_function = torch.exp
+        elif log_inv_function == 'softplus':
+            self.log_inv_function = nn.functional.softplus
+        
+        self.device = device
+
+        self.log_lamda = torch.nn.Parameter(torch.FloatTensor([0.0]), requires_grad=False)
+        self.rec_constraint_ma = None
+
+        self.last_loss = None
+
+
+    def update_rec_constraint_ma(self, cons):
+        if self.rec_constraint_ma is None:
+            self.rec_constraint_ma = torch.FloatTensor([cons]).to(self.device)
         else:
-            prior_out = self._p_sample_z_q
-        encoder_features = prior_out['encoder_features']
-        decoder_features = prior_out['decoder_features']
-        return self.f_comb(encoder_features, decoder_features)
+            self.rec_constraint_ma = self.decay * self.rec_constraint_ma.detach() + (1-self.decay) * cons
+    
 
-    def rec_loss(self, seg, img, mask=None, top_k_percentage=None, deterministic=True):
-        reconstruction = self.reconstruct(seg, img, mean=deterministic)  # (B, num_classes, H, W)
-        if seg.dim() == 4:
-            seg_target = seg.argmax(dim=1)
-        else:
-            seg_target = seg
-        loss_val = F.cross_entropy(reconstruction, seg_target, reduction='mean')
-        return loss_val
+    def forward(self, yhat, y, kls, **kwargs):
+        rec_loss_before_mean = self.reconstruction_loss(yhat, y, **kwargs).sum( dim=tuple(range(1,self.conv_dim)) )
+        rec_loss = rec_loss_before_mean.mean()
+        rec_constraint = rec_loss - self.kappa
 
-    def kl(self, seg, img):
-        self._build(seg, img)
-        q_dists = self._q_sample['distributions']
-        p_dists = self._p_sample_z_q['distributions']
-        kl_dict = {}
-        for level, (q, p) in enumerate(zip(q_dists, p_dists)):
-            kl_per_pixel = torch.distributions.kl_divergence(q, p)
-            kl_per_instance = kl_per_pixel.view(kl_per_pixel.shape[0], -1).sum(dim=1)
-            kl_dict[level] = kl_per_instance.mean()
-        return kl_dict
+        # Update EMA
+        if self.training is True:
+            self.update_rec_constraint_ma(rec_constraint)
 
-    def loss(self, seg, img, mask=None):
-        summaries = {}
-        rec_loss_val = self.rec_loss(seg, img, mask)
-        kl_dict = self.kl(seg, img)
-        kl_sum = sum(kl_dict.values())
-        summaries['rec_loss'] = rec_loss_val.item()
-        summaries['kl_sum'] = kl_sum.item()
-        for level, kl_val in kl_dict.items():
-            summaries[f'kl_{level}'] = kl_val.item()
-        if self._loss_kwargs['type'] == 'elbo':
-            beta = self._loss_kwargs.get('beta', 1.0)
-            loss_val = rec_loss_val + beta * kl_sum
-            summaries['elbo_loss'] = loss_val.item()
-        elif self._loss_kwargs['type'] == 'geco':
-            ma_rec_loss = self._moving_average(rec_loss_val)
-            reconstruction_threshold = self._loss_kwargs['kappa']
-            rec_constraint = ma_rec_loss - reconstruction_threshold
-            lagmul = self._lagmul(rec_constraint)
-            loss_val = lagmul * rec_constraint + kl_sum
-            summaries['geco_loss'] = loss_val.item()
-            summaries['ma_rec_loss'] = ma_rec_loss.item()
-            summaries['lagmul'] = lagmul.item()
-        else:
-            raise NotImplementedError(f"Loss type {self._loss_kwargs['type']} not implemented!")
-        return {'supervised_loss': loss_val, 'summaries': summaries}
+        # Calculate Loss
+        rec_constraint_ma = rec_constraint + (self.rec_constraint_ma - rec_constraint).detach()
+        lamda = self.log_inv_function(self.log_lamda)
+
+        rec_term = lamda * rec_constraint_ma
+        kl_term = torch.sum(kls)
+        loss = rec_term + kl_term
+
+        self.last_loss = {
+            'reconstruction_loss_before_mean': rec_loss_before_mean,
+            'reconstruction_term': rec_term,
+            'kl_term': kl_term,
+            'loss': loss,
+            'reconstruction_internal': self.reconstruction_loss.last_loss
+        }
+
+        # Step Lambda
+        if self.training is True:
+            with torch.no_grad():
+                self.log_lamda += self.update_rate * kwargs['lr'] * rec_constraint_ma
+
+        return loss

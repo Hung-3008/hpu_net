@@ -1,0 +1,57 @@
+# Data Configuration
+data:
+  train_file: "datasets/ACDC/lists_ACDC/train.txt"
+  train_size: null  # If null, the whole training set will be used
+  val_file: "datasets/ACDC/lists_ACDC/valid.txt"
+  val_size: null  # If null, the whole validation set will be used
+  val_period: 100
+  val_bs: 8
+  normalization: "standard"
+  random_seed: 0
+
+# Model Configuration
+model:
+  in_ch: 1
+  out_ch: 4  # For ACDC, we have 4 classes
+  intermediate_ch: [32, 64, 128, 256]
+  kernel_size: [3, 3, 3, 3]
+  scale_depth: [2, 2, 2, 2]
+  dilation: [1, 1, 1, 1]
+  padding_mode: "zeros"
+  
+  # Latent space configuration
+  latent_num: 3
+  latent_chs: [1, 1, 1]
+  latent_locks: [0, 0, 0]  # 0 for unlocked, 1 for locked
+
+# Loss Configuration
+loss:
+  rec_type: "crossentropy"
+  loss_type: "GECO"
+  
+  # ELBO parameters (if used)
+  beta: 1.0
+  beta_asc_steps: null
+  beta_cons_steps: 1
+  beta_saturation_step: null
+  
+  # GECO parameters (if used)
+  kappa: 0.1
+  kappa_px: false
+  decay: 0.9
+  update_rate: 0.01
+
+# Training Configuration
+training:
+  epochs: 300
+  bs: 32
+  optimizer: "adam"
+  wd: 0.0
+  lr: 1.0e-4
+  scheduler_type: "cons"
+  scheduler_step_size: 128
+  scheduler_milestones: null
+  scheduler_gamma: 0.1
+  save_period: 128
+  output_dir: "runs"
+  comment: "ACDC_HPUNet"

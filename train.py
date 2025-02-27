@@ -1,161 +1,185 @@
-#!/usr/bin/env python
-import os
+############ train_acdc.py
+import time
+from random import randrange
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import datetime
+from torchvision.utils import make_grid
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-# Import your dataset and augmentation
-from dataset_ACDC import ACDCdataset, RandomGenerator
+from model import HPUNet
 
-# Import the model (assumed to be defined in hierarchical_probabilistic_unet/model.py)
-from model import HierarchicalProbUNet
+def train_model(args, model, dataloader, criterion, optimizer, lr_scheduler, writer, device='cpu', val_dataloader=None, start_time=None): 
+    history = {
+        'training_time(min)': None
+    }
 
-def train_epoch(model, dataloader, optimizer, device, writer, epoch):
-    model.train()
-    running_loss = 0.0
-    for batch_idx, sample in enumerate(dataloader):
-        # Get the image and label from the sample.
-        # In your dataset, 'image' is shape (B, 1, H, W) and 'label' is (B, H, W) (class indices).
-        img = sample['image'].to(device)
-        label = sample['label'].to(device)  # integer labels
+    if val_dataloader is not None:
+        val_minibatches = len(val_dataloader)
 
-        optimizer.zero_grad()
-        # The model's loss() method expects seg (label) and img.
-        loss_dict = model.loss(label, img, mask=None)
-        loss = loss_dict['supervised_loss']
-        loss.backward()
-        optimizer.step()
+    def record_history(idx, loss_dict, type='train'):
+        prefix = 'Minibatch Training ' if type == 'train' else 'Mean Validation '
 
-        running_loss += loss.item()
-        if batch_idx % 10 == 0:
-            print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
-            # Log batch-level training loss
-            global_step = epoch * len(dataloader) + batch_idx
-            writer.add_scalar('Training/BatchLoss', loss.item(), global_step)
-            
-            # Log additional loss components if available
-            for k, v in loss_dict.items():
-                if k != 'supervised_loss' and isinstance(v, torch.Tensor):
-                    writer.add_scalar(f'Training/{k}', v.item(), global_step)
-    
-    avg_loss = running_loss / len(dataloader)
-    return avg_loss
+        loss_per_pixel = loss_dict['loss'].item() / args.pixels
+        reconstruction_per_pixel = loss_dict['reconstruction_term'].item() / args.pixels
+        kl_term_per_pixel = loss_dict['kl_term'].item() / args.pixels
+        kl_per_pixel = [ loss_dict['kls'][v].item() / args.pixels for v in range(args.latent_num) ]
 
-def main():
-    # -------------------------------
-    # Configuration (adjust as needed)
-    # -------------------------------
-    base_dir = "datasets/ACDC"     # Path where the ACDC .npz files are stored.
-    list_dir = "datasets/ACDC/lists_ACDC"     # Path to the text files listing the cases.
-    split = "train"                     # or "valid"
-    output_size = (128, 128)            # Target output size.
-    batch_size = 2
-    num_epochs = 50
-    learning_rate = 1e-4
-    
-    # Create logs directory for TensorBoard
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = os.path.join("logs", f"hpunet_run_{timestamp}")
-    os.makedirs(log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir)
-    
-    print(f"TensorBoard logs will be saved to {log_dir}")
-    print(f"View them by running: tensorboard --logdir={log_dir}")
-
-    # -------------------------------
-    # Create the Dataset and DataLoader
-    # -------------------------------
-    transform = RandomGenerator(output_size)
-    train_dataset = ACDCdataset(base_dir, list_dir, split, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-
-    # -------------------------------
-    # Set up device and model
-    # -------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = HierarchicalProbUNet(
-        latent_dims=(4, 4, 4),                # 3 latent scales, each with 4 channels
-        channels_per_block=(64, 128, 256, 512, 512),  # 5 encoder levels
-        num_classes=4,                        # For binary segmentation (e.g. background vs. myocardium)
-        down_channels_per_block=(32, 64, 128, 256, 256), # Intermediate channel counts
-        activation_fn=F.relu,
-        convs_per_block=3,
-        blocks_per_level=3,
-        loss_kwargs={
-            'type': 'geco',
-            'top_k_percentage': 0.02,
-            'deterministic_top_k': False,
-            'kappa': 0.05,
-            'decay': 0.99,
-            'rate': 1e-2,
-            'beta': 1.0
+        # Total Loss
+        _dict = {   
+            'total': loss_per_pixel,
+            'kl term': kl_term_per_pixel, 
+            'reconstruction': reconstruction_per_pixel  
         }
-    ).to(device)
+        writer.add_scalars(prefix + 'Loss Curve', _dict, idx)
 
-    # Log model graph
-    sample_input = torch.randn(1, 1, output_size[0], output_size[1]).to(device)
-    try:
-        writer.add_graph(model, sample_input)
-    except Exception as e:
-        print(f"Failed to add model graph to TensorBoard: {e}")
+        # KL Term Decomposition
+        _dict = { 'sum': sum(kl_per_pixel) }
+        _dict.update({ 'scale {}'.format(v): kl_per_pixel[v] for v in range(args.latent_num) })
+        writer.add_scalars(prefix + 'Loss Curve (K-L)', _dict, idx)
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        # Coefficients
+        if type == 'train':
+            if args.loss_type.lower() == 'elbo':
+                writer.add_scalar('Beta', criterion.beta_scheduler.beta, idx)
+            elif args.loss_type.lower() == 'geco':
+                lamda = criterion.log_inv_function(criterion.log_lamda).item()
+                writer.add_scalar('Lagrange Multiplier', lamda, idx)
+                writer.add_scalar('Beta', 1/(lamda+1e-20), idx)
 
-    # -------------------------------
-    # Training Loop
-    # -------------------------------
-    for epoch in range(num_epochs):
-        avg_loss = train_epoch(model, train_loader, optimizer, device, writer, epoch)
-        print(f"Epoch {epoch} Average Loss: {avg_loss:.4f}")
-        
-        # Log epoch-level metrics
-        writer.add_scalar('Training/EpochLoss', avg_loss, epoch)
-        writer.add_scalar('Training/LearningRate', optimizer.param_groups[0]['lr'], epoch)
-        
-        # Log sample predictions periodically
-        if epoch % 5 == 0:
-            # Get a sample batch
-            with torch.no_grad():
-                for sample in train_loader:
-                    img = sample['image'].to(device)
-                    label = sample['label'].to(device)
+    # Prepare a batch of validation images and labels for visualization.
+    # Note: Each item in the dataloader is a dict. We assume the keys are 'image' and 'label'.
+    val_batch = next(iter(val_dataloader))
+    # For visualization, select a subset and extract the tensors.
+    val_images = val_batch['image'][:16]
+
+    # Ensure validation images have the correct number of channels (1)
+    if val_images.ndim == 3:  # If missing channel dimension
+        val_images = val_images.unsqueeze(1)  # Add channel dimension
+    elif val_images.shape[1] != 1:  # If wrong number of channels
+        # Take first channel or average all channels
+        val_images = val_images[:, 0:1, :, :]  # Take first channel only
+
+    val_truths = val_batch['label'][:16]
+    truth_grid = make_grid(val_truths, nrow=4, pad_value=val_truths.min().item())
+    fig, ax = plt.subplots(figsize=(6,6))
+    ax.imshow(truth_grid[0])
+    ax.set_axis_off()
+    fig.tight_layout()
+    writer.add_figure('Validation Images / Ground Truth', fig)
+    val_images_selection = val_images.to(device).float() 
+    
+    last_time_checkpoint = start_time
+    for e in range(args.epochs):
+        for mb, sample in enumerate(tqdm(dataloader)):
+            idx = e * len(dataloader) + mb + 1
+
+            # Set to training mode
+            criterion.train()
+            model.train()
+            model.zero_grad()
+
+            # Extract images and labels from the dictionary
+            images = sample['image'].to(device).float()
+            truths = sample['label'].to(device).float()
+
+            # If needed, squeeze or adjust dimensions to match your model's expected input
+            # (For example, if truths are provided with an extra dimension)
+            truths = truths.squeeze(dim=1)
+            truths_unsqueezed = truths.unsqueeze(1)
+            # Forward pass: if your model expects a target for posterior network training, pass truths
+            preds, infodicts = model(images, truths_unsqueezed)
+            preds, infodict = preds[:,0], infodicts[0]
+
+            # Calculate Loss
+            loss = criterion(preds, truths, kls=infodict['kls'], lr=lr_scheduler.get_last_lr()[0])
+
+            # Backpropagate and update weights
+            loss.backward()
+            optimizer.step()
+            
+            # Update beta scheduler if using ELBO loss
+            if args.loss_type.lower() == 'elbo':
+                criterion.beta_scheduler.step()
+
+            # Record training history
+            loss_dict = criterion.last_loss.copy()
+            loss_dict.update({'kls': infodict['kls']})
+            record_history(idx, loss_dict)
+            
+            # Validation periodically
+            if idx % args.val_period == 0 and val_dataloader is not None:
+                criterion.eval()
+                model.eval()
+                with torch.no_grad():
+                    # Forward pass on the validation images; here we assume the posterior branch is not used
+                    val_preds, _ = model(val_images_selection.float())  # Add .float() here to match model precision
+                    val_preds = val_preds[:,0]
                     
-                    # Generate a prediction (assuming the model has a predict method)
-                    try:
-                        pred = model.sample_predictions(img)
+                    out_grid = make_grid(val_preds, nrow=4, pad_value=val_preds.min().item())
+                    fig, ax = plt.subplots(figsize=(6,6))
+                    ax.imshow(out_grid[0].cpu())
+                    ax.set_axis_off()
+                    fig.tight_layout()
+                    writer.add_figure('Validation Images / Prediction', fig, idx)
+
+                # Calculate validation loss
+                mean_val_loss = torch.zeros(1, device=device)
+                mean_val_reconstruction_term = torch.zeros(1, device=device)
+                mean_val_kl_term = torch.zeros(1, device=device)
+                mean_val_kl = torch.zeros(args.latent_num, device=device)
+
+                with torch.no_grad():
+                    for _, val_sample in enumerate(val_dataloader):
+                        val_images = val_sample['image'].to(device).float()  # This is already float
                         
-                        # Log example images
-                        writer.add_images('Images/Input', img, epoch)
+                        # Explicitly select first channel only or reshape to 1 channel
+                        if val_images.shape[1] != 1:
+                            print('Warning: Validation images have more than 1 channel. Taking first channel only.')
+                            print('Shape before:', val_images.shape)
+                            continue
+                            #val_images = val_images[:, 0:1, :, :]  # Take only the first channel
                         
-                        # For visualization, convert label and prediction to same format
-                        label_vis = F.one_hot(label, num_classes=4).permute(0, 3, 1, 2).float()
-                        writer.add_images('Images/GroundTruth', label_vis, epoch)
-                        
-                        if pred is not None:
-                            writer.add_images('Images/Prediction', pred, epoch)
-                    except Exception as e:
-                        print(f"Failed to log prediction images: {e}")
-                    break  # Only process one batch
+                        val_truths = val_sample['label'].to(device).float()
+                        val_truths = val_truths.squeeze(dim=1)
+                        val_truths_unsqueezed = val_truths.unsqueeze(1)
+
+                        val_preds, val_infodicts = model(val_images, val_truths_unsqueezed)  # All tensors are now float
+                        val_preds, val_infodict = val_preds[:,0], val_infodicts[0]
+
+                        loss = criterion(val_preds, val_truths, kls=val_infodict['kls'])
+                        mean_val_loss += loss
+                        mean_val_reconstruction_term += criterion.last_loss['reconstruction_term']
+                        mean_val_kl_term += criterion.last_loss['kl_term']
+                        mean_val_kl += val_infodict['kls']
+                    
+                    mean_val_loss /= val_minibatches
+                    mean_val_reconstruction_term /= val_minibatches
+                    mean_val_kl_term /= val_minibatches
+                    mean_val_kl /= val_minibatches
+
+                loss_dict = {
+                    'loss': mean_val_loss,
+                    'reconstruction_term': mean_val_reconstruction_term,
+                    'kl_term': mean_val_kl_term,
+                    'kls': mean_val_kl
+                }
+                record_history(idx, loss_dict, type='val')
         
-        # Save checkpoint
-        if epoch % 10 == 0 or epoch == num_epochs - 1:
-            checkpoint_dir = os.path.join("checkpoints", timestamp)
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            checkpoint_path = os.path.join(checkpoint_dir, f"hpunet_epoch_{epoch}.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-            }, checkpoint_path)
-            print(f"Checkpoint saved to {checkpoint_path}")
+        # End of epoch: record time and adjust learning rate
+        time_checkpoint = time.time()
+        epoch_time = (time_checkpoint - last_time_checkpoint) / 60
+        total_time = (time_checkpoint - start_time) / 60
+        print(f'Epoch {e+1}/{args.epochs} done in {epoch_time:.1f} minutes. Total time: {total_time:.1f} minutes.')
+        last_time_checkpoint = time_checkpoint
+        
+        # Save checkpoint periodically
+        if (e+1) % args.save_period == 0 and (e+1) != args.epochs:
+            torch.save(model.state_dict(), f'{args.output_dir}/{args.stamp}/model{e+1}.pth')
+            torch.save(criterion.state_dict(), f'{args.output_dir}/{args.stamp}/loss{e+1}.pth')
+        
+        writer.add_scalar('Learning Rate', lr_scheduler.get_last_lr()[0], e)
+        lr_scheduler.step()
 
-    writer.close()
-    print("Training complete!")
-
-if __name__ == "__main__":
-    main()
+    history['training_time(min)'] = total_time
+    return history
