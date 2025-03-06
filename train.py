@@ -1,185 +1,132 @@
-############ train_acdc.py
-import time
-from random import randrange
-
 import torch
-from torchvision.utils import make_grid
-import matplotlib.pyplot as plt
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import os
+import time
 from tqdm import tqdm
+import logging
+import argparse
+import yaml
+from torch.nn import functional as F
 
-from model import HPUNet
 
-def train_model(args, model, dataloader, criterion, optimizer, lr_scheduler, writer, device='cpu', val_dataloader=None, start_time=None): 
-    history = {
-        'training_time(min)': None
-    }
+from dataset_LIDC import LIDC_IDRI  
+from model import HierarchicalProbUNet 
 
-    if val_dataloader is not None:
-        val_minibatches = len(val_dataloader)
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Train Hierarchical Probabilistic U-Net")
+    parser.add_argument('--config', type=str, default='configs/config.yml', 
+                        help='Path to YAML configuration file')
+    parser.add_argument('--data_dir', type=str, default='LIDC', 
+                        help='Path to dataset (overrides config if provided)')
+    parser.add_argument('--exp_dir', type=str, default='experiments/hpu_net', 
+                        help='Experiment directory (overrides config if provided)')
+    parser.add_argument('--cuda', type=str, default='0', 
+                        help='CUDA device ID (overrides config if provided)')
+    return parser.parse_args()
 
-    def record_history(idx, loss_dict, type='train'):
-        prefix = 'Minibatch Training ' if type == 'train' else 'Mean Validation '
+def train_epoch(model, train_loader, optimizer, device):
+    """Train the model for one epoch."""
+    model.train()
+    total_loss = 0
+    for images, labels, _ in tqdm(train_loader, desc="Training"):
+        images = images.to(device)
+        labels = labels.to(device).unsqueeze(1)  # Add channel dimension
+        mask = torch.ones_like(labels).to(device)  # Full mask for simplicity
 
-        loss_per_pixel = loss_dict['loss'].item() / args.pixels
-        reconstruction_per_pixel = loss_dict['reconstruction_term'].item() / args.pixels
-        kl_term_per_pixel = loss_dict['kl_term'].item() / args.pixels
-        kl_per_pixel = [ loss_dict['kls'][v].item() / args.pixels for v in range(args.latent_num) ]
+        optimizer.zero_grad()
+        loss_dict = model.loss(labels, images, mask)
+        loss = loss_dict['supervised_loss']
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(train_loader)
 
-        # Total Loss
-        _dict = {   
-            'total': loss_per_pixel,
-            'kl term': kl_term_per_pixel, 
-            'reconstruction': reconstruction_per_pixel  
-        }
-        writer.add_scalars(prefix + 'Loss Curve', _dict, idx)
+def validate(model, val_loader, device, n_batches):
+    """Validate the model."""
+    model.eval()
+    total_val_loss = 0
+    with torch.no_grad():
+        for batch_idx, (images, labels, _) in enumerate(val_loader):
+            if batch_idx >= n_batches:
+                break
+            images = images.to(device)
+            labels = labels.to(device).unsqueeze(1)
+            mask = torch.ones_like(labels).to(device)
+            loss_dict = model.loss(labels, images, mask)
+            total_val_loss += loss_dict['supervised_loss'].item()
+    return total_val_loss / n_batches
 
-        # KL Term Decomposition
-        _dict = { 'sum': sum(kl_per_pixel) }
-        _dict.update({ 'scale {}'.format(v): kl_per_pixel[v] for v in range(args.latent_num) })
-        writer.add_scalars(prefix + 'Loss Curve (K-L)', _dict, idx)
-
-        # Coefficients
-        if type == 'train':
-            if args.loss_type.lower() == 'elbo':
-                writer.add_scalar('Beta', criterion.beta_scheduler.beta, idx)
-            elif args.loss_type.lower() == 'geco':
-                lamda = criterion.log_inv_function(criterion.log_lamda).item()
-                writer.add_scalar('Lagrange Multiplier', lamda, idx)
-                writer.add_scalar('Beta', 1/(lamda+1e-20), idx)
-
-    # Prepare a batch of validation images and labels for visualization.
-    # Note: Each item in the dataloader is a dict. We assume the keys are 'image' and 'label'.
-    val_batch = next(iter(val_dataloader))
-    # For visualization, select a subset and extract the tensors.
-    val_images = val_batch['image'][:16]
-
-    # Ensure validation images have the correct number of channels (1)
-    if val_images.ndim == 3:  # If missing channel dimension
-        val_images = val_images.unsqueeze(1)  # Add channel dimension
-    elif val_images.shape[1] != 1:  # If wrong number of channels
-        # Take first channel or average all channels
-        val_images = val_images[:, 0:1, :, :]  # Take first channel only
-
-    val_truths = val_batch['label'][:16]
-    truth_grid = make_grid(val_truths, nrow=4, pad_value=val_truths.min().item())
-    fig, ax = plt.subplots(figsize=(6,6))
-    ax.imshow(truth_grid[0])
-    ax.set_axis_off()
-    fig.tight_layout()
-    writer.add_figure('Validation Images / Ground Truth', fig)
-    val_images_selection = val_images.to(device).float() 
+def train(cf):
+    """Main training function."""
+    # Setup logging
+    if not os.path.exists(cf['exp_dir']):
+        os.makedirs(cf['exp_dir'])
     
-    last_time_checkpoint = start_time
-    for e in range(args.epochs):
-        for mb, sample in enumerate(tqdm(dataloader)):
-            idx = e * len(dataloader) + mb + 1
+    log_file = os.path.join(cf['exp_dir'], 'train.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    logging.info("Starting training with config: %s", cf)
 
-            # Set to training mode
-            criterion.train()
-            model.train()
-            model.zero_grad()
+    # Device setup
+    device = torch.device(f"cuda:{cf['cuda_visible_devices']}" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
 
-            # Extract images and labels from the dictionary
-            images = sample['image'].to(device).float()
-            truths = sample['label'].to(device).float()
+    # Data loaders
+    train_dataset = LIDC_IDRI(cf['data_dir'], split='train', transform=None)
+    val_dataset = LIDC_IDRI(cf['data_dir'], split='val', transform=None)
+    train_loader = DataLoader(train_dataset, batch_size=cf['batch_size'], 
+                              shuffle=True, num_workers=cf['num_workers'])
+    val_loader = DataLoader(val_dataset, batch_size=cf['batch_size'], 
+                            shuffle=False, num_workers=cf['num_workers'])
+    logging.info(f"Loaded {len(train_dataset)} train and {len(val_dataset)} val samples")
 
-            # If needed, squeeze or adjust dimensions to match your model's expected input
-            # (For example, if truths are provided with an extra dimension)
-            truths = truths.squeeze(dim=1)
-            truths_unsqueezed = truths.unsqueeze(1)
-            # Forward pass: if your model expects a target for posterior network training, pass truths
-            preds, infodicts = model(images, truths_unsqueezed)
-            preds, infodict = preds[:,0], infodicts[0]
+    # Model and optimizer
+    model = HierarchicalProbUNet(
+        latent_dims=tuple(cf['latent_dims']),
+        channels_per_block=cf['channels_per_block'],
+        num_classes=cf['num_classes'],
+        activation_fn=cf['activation_fn'],
+        convs_per_block=cf['convs_per_block'],
+        blocks_per_level=cf['blocks_per_level'],
+        loss_kwargs=cf['loss_kwargs'],
+        in_channels=1  # Assuming grayscale images
+    ).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cf['learning_rate'])
+    logging.info("Model and optimizer initialized")
 
-            # Calculate Loss
-            loss = criterion(preds, truths, kls=infodict['kls'], lr=lr_scheduler.get_last_lr()[0])
+    # Training loop
+    for epoch in range(cf['num_epochs']):
+        train_loss = train_epoch(model, train_loader, optimizer, device)
+        val_loss = validate(model, val_loader, device, cf['validation']['n_batches'])
+        logging.info(f"Epoch {epoch+1}/{cf['num_epochs']}: Train Loss: {train_loss:.4f}, "
+                     f"Val Loss: {val_loss:.4f}")
 
-            # Backpropagate and update weights
-            loss.backward()
-            optimizer.step()
-            
-            # Update beta scheduler if using ELBO loss
-            if args.loss_type.lower() == 'elbo':
-                criterion.beta_scheduler.step()
+        if (epoch + 1) % cf['save_every_n_epochs'] == 0:
+            checkpoint_path = os.path.join(cf['exp_dir'], f"model_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+            logging.info(f"Checkpoint saved: {checkpoint_path}")
 
-            # Record training history
-            loss_dict = criterion.last_loss.copy()
-            loss_dict.update({'kls': infodict['kls']})
-            record_history(idx, loss_dict)
-            
-            # Validation periodically
-            if idx % args.val_period == 0 and val_dataloader is not None:
-                criterion.eval()
-                model.eval()
-                with torch.no_grad():
-                    # Forward pass on the validation images; here we assume the posterior branch is not used
-                    val_preds, _ = model(val_images_selection.float())  # Add .float() here to match model precision
-                    val_preds = val_preds[:,0]
-                    
-                    out_grid = make_grid(val_preds, nrow=4, pad_value=val_preds.min().item())
-                    fig, ax = plt.subplots(figsize=(6,6))
-                    ax.imshow(out_grid[0].cpu())
-                    ax.set_axis_off()
-                    fig.tight_layout()
-                    writer.add_figure('Validation Images / Prediction', fig, idx)
+if __name__ == "__main__":
+    args = parse_args()
 
-                # Calculate validation loss
-                mean_val_loss = torch.zeros(1, device=device)
-                mean_val_reconstruction_term = torch.zeros(1, device=device)
-                mean_val_kl_term = torch.zeros(1, device=device)
-                mean_val_kl = torch.zeros(args.latent_num, device=device)
+    if os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            cf = yaml.safe_load(f)
+    else:
+        raise FileNotFoundError(f"Config file not found: {args.config}")
+    
+    activation_map = {
+    'relu': nn.ReLU,
+    'leaky_relu': nn.LeakyReLU,
+    }
+    cf['activation_fn'] = activation_map[cf['activation_fn']]
 
-                with torch.no_grad():
-                    for _, val_sample in enumerate(val_dataloader):
-                        val_images = val_sample['image'].to(device).float()  # This is already float
-                        
-                        # Explicitly select first channel only or reshape to 1 channel
-                        if val_images.shape[1] != 1:
-                            print('Warning: Validation images have more than 1 channel. Taking first channel only.')
-                            print('Shape before:', val_images.shape)
-                            continue
-                            #val_images = val_images[:, 0:1, :, :]  # Take only the first channel
-                        
-                        val_truths = val_sample['label'].to(device).float()
-                        val_truths = val_truths.squeeze(dim=1)
-                        val_truths_unsqueezed = val_truths.unsqueeze(1)
-
-                        val_preds, val_infodicts = model(val_images, val_truths_unsqueezed)  # All tensors are now float
-                        val_preds, val_infodict = val_preds[:,0], val_infodicts[0]
-
-                        loss = criterion(val_preds, val_truths, kls=val_infodict['kls'])
-                        mean_val_loss += loss
-                        mean_val_reconstruction_term += criterion.last_loss['reconstruction_term']
-                        mean_val_kl_term += criterion.last_loss['kl_term']
-                        mean_val_kl += val_infodict['kls']
-                    
-                    mean_val_loss /= val_minibatches
-                    mean_val_reconstruction_term /= val_minibatches
-                    mean_val_kl_term /= val_minibatches
-                    mean_val_kl /= val_minibatches
-
-                loss_dict = {
-                    'loss': mean_val_loss,
-                    'reconstruction_term': mean_val_reconstruction_term,
-                    'kl_term': mean_val_kl_term,
-                    'kls': mean_val_kl
-                }
-                record_history(idx, loss_dict, type='val')
-        
-        # End of epoch: record time and adjust learning rate
-        time_checkpoint = time.time()
-        epoch_time = (time_checkpoint - last_time_checkpoint) / 60
-        total_time = (time_checkpoint - start_time) / 60
-        print(f'Epoch {e+1}/{args.epochs} done in {epoch_time:.1f} minutes. Total time: {total_time:.1f} minutes.')
-        last_time_checkpoint = time_checkpoint
-        
-        # Save checkpoint periodically
-        if (e+1) % args.save_period == 0 and (e+1) != args.epochs:
-            torch.save(model.state_dict(), f'{args.output_dir}/{args.stamp}/model{e+1}.pth')
-            torch.save(criterion.state_dict(), f'{args.output_dir}/{args.stamp}/loss{e+1}.pth')
-        
-        writer.add_scalar('Learning Rate', lr_scheduler.get_last_lr()[0], e)
-        lr_scheduler.step()
-
-    history['training_time(min)'] = total_time
-    return history
+    train(cf)

@@ -1,57 +1,39 @@
-# Data Configuration
-data:
-  train_file: "datasets/ACDC/lists_ACDC/train.txt"
-  train_size: null  # If null, the whole training set will be used
-  val_file: "datasets/ACDC/lists_ACDC/valid.txt"
-  val_size: null  # If null, the whole validation set will be used
-  val_period: 100
-  val_bs: 16
-  normalization: "standard"
-  random_seed: 0
+# Data settings
+data_dir: datasets/LIDC
+batch_size: 4
+num_workers: 2
 
-# Model Configuration
-model:
-  in_ch: 1
-  out_ch: 4  # For ACDC, we have 4 classes
-  intermediate_ch: [32, 64, 128, 256]
-  kernel_size: [3, 3, 3, 3]
-  scale_depth: [2, 2, 2, 2]
-  dilation: [1, 1, 1, 1]
-  padding_mode: "zeros"
+# Model architecture
+latent_dims:
+  - 3
+  - 2
+  - 1
   
-  # Latent space configuration
-  latent_num: 3
-  latent_chs: [1, 1, 1]
-  latent_locks: [0, 0, 0]  # 0 for unlocked, 1 for locked
+channels_per_block:
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+num_classes: 2
+activation_fn: relu
+convs_per_block: 3
+blocks_per_level: 3
 
-# Loss Configuration
-loss:
-  rec_type: "crossentropy"
-  loss_type: "GECO"
-  
-  # ELBO parameters (if used)
-  beta: 1.0
-  beta_asc_steps: null
-  beta_cons_steps: 1
-  beta_saturation_step: null
-  
-  # GECO parameters (if used)
-  kappa: 0.1
-  kappa_px: false
-  decay: 0.9
-  update_rate: 0.01
+# Loss parameters
+loss_kwargs:
+  type: geco
+  top_k_percentage: 0.02
+  deterministic_top_k: false
+  kappa: 0.05
+  decay: 0.99
+  rate: 0.01
 
-# Training Configuration
-training:
-  epochs: 200
-  bs: 32
-  optimizer: "adam"
-  wd: 0.0
-  lr: 1.0e-4
-  scheduler_type: "cons"
-  scheduler_step_size: 128
-  scheduler_milestones: null
-  scheduler_gamma: 0.1
-  save_period: 128
-  output_dir: "runs"
-  comment: "ACDC_HPUNet"
+# Training settings
+learning_rate: 0.0001
+num_epochs: 100
+validation:
+  n_batches: 10
+exp_dir: experiments/hpu_net
+save_every_n_epochs: 10
+cuda_visible_devices: '0'

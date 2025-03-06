@@ -1,475 +1,449 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.nn import MSELoss
+import torch.nn.functional as F
+from torch.distributions import MultivariateNormal
+from geco import *
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, activation="ReLU", kernel_size=3, dilation=1, padding_mode='circular', conv_class=nn.Conv2d):
+class ResBlock(nn.Module):
+    def __init__(self, input_channels, n_channels, n_down_channels, convs_per_block, activation_fn):
         super().__init__()
-        self.conv1 = conv_class(in_channels=in_ch, out_channels=out_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
-        self.conv2 = conv_class(in_channels=out_ch, out_channels=out_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
-
-        if activation.lower() == "relu":
-            self.activation = nn.ReLU()
-        elif activation.lower() == "elu":
-            self.activation = nn.ELU()
-        elif activation.lower() == "leakyrelu":
-            self.activation = nn.LeakyReLU()
+        layers = []
+        in_channels = input_channels
+        for i in range(convs_per_block):
+            out_channels = n_down_channels if i < convs_per_block - 1 else n_channels
+            conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+            layers.append(conv)
+            if i < convs_per_block - 1:
+                layers.append(activation_fn())
+            in_channels = out_channels
+        self.conv_layers = nn.Sequential(*layers)
+        self.shortcut = nn.Conv2d(input_channels, n_channels, kernel_size=1) if input_channels != n_channels else nn.Identity()
+        self.activation = activation_fn()
 
     def forward(self, x):
-        f = self.activation(self.conv1(x))
-        f = self.activation(self.conv2(f))
+        residual = self.shortcut(x)
+        out = self.conv_layers(x)
+        out += residual
+        out = self.activation(out)
+        return out
 
-        return f
+
+def resize_down(x, scale):
+    return F.interpolate(x, scale_factor=1/scale, mode='bilinear', align_corners=False)
+
+def resize_up(x, scale):
+    return F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
 
 
-class PreResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch=None, activation="ReLU", kernel_size=3, dilation=1, padding_mode='circular', conv_class=nn.Conv2d):
+class _HierarchicalCore(nn.Module):
+    def __init__(self, input_channels, latent_dims, channels_per_block,      down_channels_per_block=None, activation_fn=nn.ReLU, initializers=None, convs_per_block=3, blocks_per_level=3, name='prior'):
         super().__init__()
-        
-        if out_ch is None:
-            out_ch = in_ch
-            self.skipconv = nn.Identity()
-        else:
-            self.skipconv = conv_class(in_channels=in_ch, out_channels=out_ch, kernel_size=1)
+        self.input_channels = input_channels
+        self.latent_dims = latent_dims
+        self.channels_per_block = channels_per_block
+        self.down_channels_per_block = down_channels_per_block if down_channels_per_block is not None else channels_per_block
+        self.activation_fn = activation_fn
+        self.initializers = initializers
+        self.convs_per_block = convs_per_block
+        self.blocks_per_level = blocks_per_level
+        self.num_levels = len(channels_per_block)
+        self.num_latent_levels = len(latent_dims)
+        self.name = name
 
-        if activation.lower() == "relu":
-            self.activation = nn.ReLU()
-        elif activation.lower() == "elu":
-            self.activation = nn.ELU()
-        elif activation.lower() == "leakyrelu":
-            self.activation = nn.LeakyReLU()
+        # Encoder layers
+        self.encoder_levels = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        current_channels = input_channels
+        for level in range(self.num_levels):
+            blocks = nn.ModuleList()
+            for _ in range(blocks_per_level):
+                block = ResBlock(
+                    input_channels=current_channels,
+                    n_channels=self.channels_per_block[level],
+                    n_down_channels=self.down_channels_per_block[level],
+                    convs_per_block=convs_per_block,
+                    activation_fn=activation_fn
+                )
+                blocks.append(block)
+                current_channels = self.channels_per_block[level]
+            self.encoder_levels.append(blocks)
+            if level != self.num_levels - 1:
+                downsample = nn.Conv2d(current_channels, current_channels, kernel_size=3, stride=2, padding=1)
+                self.downsample_layers.append(downsample)
+            else:
+                self.downsample_layers.append(None)
 
-        med_ch = in_ch//2 if in_ch > 1 else 1
+        # Decoder layers
+        self.mu_logsigma_convs = nn.ModuleList()
+        self.decoder_upsample_layers = nn.ModuleList()
+        self.decoder_levels = nn.ModuleList()
+        decoder_input_channels = self.channels_per_block[-1]
+        for level in range(self.num_latent_levels):
+            latent_dim = self.latent_dims[level]
+            mu_logsigma_conv = nn.Conv2d(decoder_input_channels, 2 * latent_dim, kernel_size=1)
+            self.mu_logsigma_convs.append(mu_logsigma_conv)
+            upsample = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(decoder_input_channels + latent_dim, decoder_input_channels + latent_dim, kernel_size=3, padding=1)
+            )
+            self.decoder_upsample_layers.append(upsample)
+            concat_channels = (decoder_input_channels + latent_dim) + self.channels_per_block[self.num_levels - level - 2]
+            blocks = nn.ModuleList()
+            for i in range(blocks_per_level):
+                in_channels = concat_channels if i == 0 else self.channels_per_block[self.num_levels - level - 2]
+                block = ResBlock(
+                    input_channels=in_channels,
+                    n_channels=self.channels_per_block[self.num_levels - level - 2],
+                    n_down_channels=self.down_channels_per_block[::-1][level + 1],
+                    convs_per_block=convs_per_block,
+                    activation_fn=activation_fn
+                )
+                blocks.append(block)
+            self.decoder_levels.append(blocks)
+            decoder_input_channels = self.channels_per_block[self.num_levels - level - 2]
+            #print(f'Level {level} decoder_input_channels: {decoder_input_channels}')
 
-        self.bn1 = nn.BatchNorm2d(num_features=in_ch) if conv_class == nn.Conv2d else nn.BatchNorm1d(num_features=in_ch)
-        self.bn2 = nn.BatchNorm2d(num_features=med_ch) if conv_class == nn.Conv2d else nn.BatchNorm1d(num_features=med_ch)
-        self.conv1 = conv_class(in_channels=in_ch, out_channels=med_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
-        self.conv2 = conv_class(in_channels=med_ch, out_channels=med_ch, kernel_size=kernel_size, dilation=dilation, padding='same', padding_mode=padding_mode)
-        self.outconv = conv_class(in_channels=med_ch, out_channels=out_ch, kernel_size=1)
+    def forward(self, inputs, mean=False, z_q=None):
+        encoder_features = inputs
+        encoder_outputs = []
+        mean = [mean] * self.num_latent_levels if isinstance(mean, bool) else mean
+        distributions = []
+        used_latents = []
 
-    def forward(self, x):
-        f = self.conv1(self.activation(self.bn1(x)))
-        f = self.conv2(self.activation(self.bn2(f)))
-        f = self.outconv(f)
+        # Encoder forward
+        for level in range(self.num_levels):
 
-        return f + self.skipconv(x)
+            for block in self.encoder_levels[level]:
+                encoder_features = block(encoder_features)
+                #print level and shape of encoder_features
+                #print(f'Level {level} encoder_features shape: {encoder_features.shape}')
+            encoder_outputs.append(encoder_features)
+            if level != self.num_levels - 1:
+                encoder_features = self.downsample_layers[level](encoder_features)
 
+        # Decoder forward
+        decoder_features = encoder_outputs[-1]
+        for level in range(self.num_latent_levels):
 
-class ScaleBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, activation="ReLU", scale_depth=1, kernel_size=3, dilation=1, padding_mode='circular', conv_class=nn.Conv2d):
-        super().__init__()
-        
-        self.first_preres_blocks = nn.ModuleList( [ PreResBlock(in_ch, None, activation, kernel_size, dilation, padding_mode=padding_mode, conv_class=conv_class) for _ in range(scale_depth-1) ] )
-        self.last_preres_block = PreResBlock(in_ch, out_ch, activation, kernel_size, dilation, padding_mode=padding_mode, conv_class=conv_class)
-
-    def forward(self, x):
-        f = x
-        if len(self.first_preres_blocks) > 0:
-            for block in self.first_preres_blocks:
-                f = block(f)
-        f = self.last_preres_block(f)
-
-        return f
-
-
-class Encoder(nn.Module):
-    def __init__(self, chs, activation="ReLU", scale_depth=1, kernel_size=None, dilation=None, padding_mode='circular', conv_class=nn.Conv2d):
-        super().__init__()
-        self.downsampling = nn.AvgPool2d(kernel_size=2) if conv_class == nn.Conv2d else nn.AvgPool1d(kernel_size=2)
-        self.encoder_blocks = nn.ModuleList( [ ScaleBlock(chs[i], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) for i in range(len(chs)-1) ] )
-
-    def forward(self, x):
-        encoder_feature_maps = [x]
-        f = x
-        for block in self.encoder_blocks:
-            f = self.downsampling(f)
-            f = block(f)
-            encoder_feature_maps.append(f)
-
-        encoder_feature_maps.reverse()
-        return encoder_feature_maps
-
-
-class Decoder(nn.Module):
-    def __init__(self, chs, latent_num=0, activation="ReLU", scale_depth=1, kernel_size=None, dilation=None, padding_mode='circular', latent_channels=None, latent_locks=None, conv_class=nn.Conv2d):
-        super().__init__()
-        self.depth = len(chs) - 1
-        self.latent_num = latent_num
-        self.latent_channels = latent_channels
-        self.latent_locks = latent_locks
-
-        self.upsampling = nn.Upsample(scale_factor=2, mode='nearest')
-
-        # Prior Net
-        self.latent_mean_convs = nn.ModuleList(
-            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ] 
-        )
-
-        self.latent_std_convs = nn.ModuleList(
-            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ]
-        )
-        self.decoder_blocks = nn.ModuleList(
-            [ ScaleBlock(chs[i] + chs[i+1] + latent_channels[i], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) if i < latent_num
-            else ScaleBlock(chs[i] + chs[i+1], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) for i in range(self.depth) ]
-        )
-
-        # Posterior Net
-        self.post_latent_mean_convs = nn.ModuleList(
-            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ]
-        )
-        self.post_latent_std_convs = nn.ModuleList(
-            [ conv_class(in_channels=chs[i], out_channels=latent_channels[i], kernel_size=1) for i in range(latent_num) ]
-        )
-        self.post_decoder_blocks = nn.ModuleList(
-            [ ScaleBlock(chs[i] + chs[i+1] + latent_channels[i], chs[i+1], activation, scale_depth[i+1], kernel_size[i+1], dilation[i+1], padding_mode=padding_mode, conv_class=conv_class) for i in range(latent_num - 1) ]
-        )
-
-
-    def sample_latent(self, means, log_stds, latent_lock):
-        if latent_lock is True:
-            latent = means
-        else:
-            rands = torch.normal( mean=torch.zeros_like(means), std=torch.ones_like(log_stds) )
-            latent = rands * torch.exp(log_stds) + means
-
-        return latent
-    
-
-    def forward(self, feature_maps, post_feature_maps=None, insert_from_postnet=False):
-        if post_feature_maps is None:  # Not Using Posterior Net
-            prior_means, prior_stds = [], []
-            prior_latents = []
-            f = feature_maps[0]
-            for i in range(self.depth):
-                if i < self.latent_num:
-                    means, log_stds = self.latent_mean_convs[i](f), self.latent_std_convs[i](f)
-                    prior_means.append(means)
-                    prior_stds.append(torch.exp(log_stds))
-
-                    latent = self.sample_latent(means, log_stds, self.latent_locks[i])
-                    prior_latents.append(latent)
-
-                    f = torch.cat([f, latent], dim=1)
-
-                f = self.upsampling(f)
-
-                f = torch.cat([ f, feature_maps[i+1] ], dim=1)
-                f = self.decoder_blocks[i](f)
-
-            if self.latent_num == self.depth + 1:
-                means, log_stds = self.latent_mean_convs[self.depth](f), self.latent_std_convs[self.depth](f)
-                latent = self.sample_latent(means, log_stds, self.latent_locks[self.depth])
-
-                f = torch.cat([f, latent], dim=1)
-
-
-            # Items to return as well as the network's output
-            infodict = {
-                'prior_latents': prior_latents,
-                'prior_means': prior_means,
-                'prior_stds': prior_stds
-            }
-
-            return f, infodict
-        
-        
-        else:  # Using Posterior Net
-            post_means, post_stds = [], []
-            post_latents = []
-            l = post_feature_maps[0]
-            for i in range(self.latent_num):
-                means, log_stds = self.post_latent_mean_convs[i](l), self.post_latent_std_convs[i](l)
-                post_means.append(means)
-                post_stds.append(torch.exp(log_stds))
-                
-                post_latent = self.sample_latent(means, log_stds, self.latent_locks[i])
-
-                post_latents.append(post_latent)
-
-                if i < self.latent_num - 1:
-                    l = torch.cat([l, post_latent], dim=1)
-                    l = self.upsampling(l)
-
-                    l = torch.cat([ l, post_feature_maps[i+1] ], dim=1)
-                    l = self.post_decoder_blocks[i](l)
-
-            prior_means, prior_stds = [], []
-            prior_latents = []
-            f = feature_maps[0]
-            for i in range(self.depth):
-                if i < self.latent_num:
-                    means, log_stds = self.latent_mean_convs[i](f), self.latent_std_convs[i](f)
-                    prior_means.append(means)
-                    prior_stds.append(torch.exp(log_stds))
-                    
-                    if (self.training is True and self.latent_locks[i] is False) or (insert_from_postnet is True):  # Insert Latents from Posterior Net
-                        latent = post_latents[i]
-                    else:  # Insert Latents from Prior Net
-                        latent = self.sample_latent(means, log_stds, self.latent_locks[i])
-
-                    prior_latents.append(latent)
-
-                    f = torch.cat([f, latent], dim=1)
-
-                f = self.upsampling(f)
-
-                f = torch.cat([ f, feature_maps[i+1] ], dim=1)
-                f = self.decoder_blocks[i](f)
+            mu_logsigma = self.mu_logsigma_convs[level](decoder_features)
+            latent_dim = self.latent_dims[level]
+            mu, logsigma = torch.split(mu_logsigma, latent_dim, dim=1)
+            dist = torch.distributions.Independent(
+                torch.distributions.Normal(loc=mu, scale=torch.exp(logsigma)),
+                1
+            )
+            distributions.append(dist)
+            if z_q is not None:
+                z = z_q[level]
+            elif mean[level]:
+                z = mu
+            else:
+                z = dist.rsample()
+            used_latents.append(z)
+            decoder_output_lo = torch.cat([z, decoder_features], dim=1)
+            decoder_output_hi = self.decoder_upsample_layers[level](decoder_output_lo)
+            encoder_feature = encoder_outputs[::-1][level + 1]
             
-            if self.latent_num == self.depth + 1:
-                means, log_stds = self.latent_mean_convs[self.depth](f), self.latent_std_convs[self.depth](f)
-                prior_means.append(means)
-                prior_stds.append(torch.exp(log_stds))
-                
-                if (self.training is True and self.latent_locks[self.depth] is False) or (insert_from_postnet is True):  # Insert Latents from Posterior Net
-                    latent = post_latents[self.depth]
-                else:  # Insert Latents from Prior Net
-                    latent = self.sample_latent(means, log_stds, self.latent_locks[self.depth])
+            decoder_features = torch.cat([decoder_output_hi, encoder_feature], dim=1)
+            for block in self.decoder_levels[level]:
+                #print(f'Level {level} decoder_features shape: {decoder_features.shape}')
+                decoder_features = block(decoder_features)
 
-                prior_latents.append(latent)
-
-                f = torch.cat([f, latent], dim=1)
+        return {
+            'decoder_features': decoder_features,
+            'encoder_features': encoder_outputs,
+            'distributions': distributions,
+            'used_latents': used_latents
+        }
 
 
-            # Calculate kl divergence between posterior net and prior net latents
-            kls = torch.zeros(self.latent_num, device=f.device) if self.latent_num > 0 else torch.zeros(1, device=f.device)  # next(self.parameters()).device
+class _StitchingDecoder(nn.Module):
+    """
+    A PyTorch module that completes the truncated U-Net decoder.
 
-            for i in range(self.latent_num):
-                if self.latent_locks[i] is False:
-                    kl = torch.log( prior_stds[i] / post_stds[i] )                             \
-                        + (    post_stds[i] ** 2  +  (post_means[i] - prior_means[i]) ** 2)     \
-                            / 2 / prior_stds[i] ** 2                                         \
-                        - 1 / 2
-                    
-                    kls[i] = kl.reshape(feature_maps[0].shape[0],-1).sum(dim=1).mean()
+    Using the output of the HierarchicalCore, this module fills in the missing
+    decoder levels such that together they form a symmetric U-Net.
+    """
+    def __init__(self, latent_dims, channels_per_block, num_classes,
+                 down_channels_per_block=None, activation_fn=F.relu,
+                 convs_per_block=3, blocks_per_level=3, name='f_comb'):
+        """
+        Initializes the _StitchingDecoder.
 
-            
-            # Items to return as well as the network's output
-            infodict = {
-                'kls': kls,
-                'post_latents': post_latents,
-                'prior_latents': prior_latents,
-                'post_means': post_means,
-                'post_stds': post_stds,
-                'prior_means': prior_means,
-                'prior_stds': prior_stds
+        Args:
+            latent_dims (list of int): Dimensions of the latents at each scale. The length
+                indicates the number of U-Net decoder scales with latents.
+            channels_per_block (list of int): Number of output channels for each encoder block.
+            num_classes (int): Number of segmentation classes.
+            down_channels_per_block (list of int, optional): Number of intermediate channels
+                for each encoder block. Defaults to channels_per_block if None.
+            activation_fn (callable, optional): Activation function. Defaults to F.relu.
+            convs_per_block (int, optional): Number of convolutional layers per residual block.
+                Defaults to 3.
+            blocks_per_level (int, optional): Number of residual blocks per decoder level.
+                Defaults to 3.
+        """
+        super(_StitchingDecoder, self).__init__()
+        self.latent_dims = latent_dims
+        self.channels_per_block = channels_per_block
+        self.num_classes = num_classes
+        self.activation_fn = activation_fn
+        self.convs_per_block = convs_per_block
+        self.blocks_per_level = blocks_per_level
+        self.down_channels_per_block = (
+            down_channels_per_block if down_channels_per_block is not None
+            else channels_per_block
+        )
+
+        self.name = name
+        num_levels = len(channels_per_block)
+        num_latents = len(latent_dims)
+        start_level = num_latents + 1
+
+        # Predefine residual blocks for each decoder level
+        self.decoder_levels = nn.ModuleList()
+        for level in range(start_level, num_levels):
+            # Input channels to the first residual block depend on the previous level's output
+            if level == start_level:
+                # Initial decoder_features channels from HierarchicalCore
+                previous_out_channels = channels_per_block[num_levels - 1 - num_latents]
+            else:
+                previous_out_channels = channels_per_block[num_levels - 1 - (level - 1)]
+            in_channels = previous_out_channels + channels_per_block[num_levels - 1 - level]
+            out_channels = channels_per_block[num_levels - 1 - level]
+            down_channels = self.down_channels_per_block[num_levels - 1 - level]
+
+            # Create a sequence of residual blocks for this level
+            level_blocks = nn.ModuleList()
+            for b in range(blocks_per_level):
+                block_in_channels = in_channels if b == 0 else out_channels
+                level_blocks.append(
+                    ResBlock(block_in_channels, out_channels, down_channels,
+                              self.convs_per_block, self.activation_fn)
+                )
+            self.decoder_levels.append(level_blocks)
+
+        # Final 1x1 convolution to produce logits
+        self.final_conv = nn.Conv2d(channels_per_block[0], num_classes, kernel_size=1)
+
+    def forward(self, encoder_features, decoder_features):
+        """
+        Computes the segmentation logits.
+
+        Args:
+            encoder_features (list of torch.Tensor): List of encoder feature tensors with shapes
+                [batch, h_i, w_i, c_i].
+            decoder_features (torch.Tensor): Decoder feature tensor from HierarchicalCore with shape
+                [batch, h, w, c].
+
+        Returns:
+            torch.Tensor: Segmentation logits with shape [batch, h, w, num_classes].
+        """
+        num_levels = len(self.channels_per_block)
+        start_level = len(self.latent_dims) + 1
+
+        # Process each decoder level
+        for level in range(start_level, num_levels):
+            # Upsample decoder features by a factor of 2
+            decoder_features = F.interpolate(
+                decoder_features, scale_factor=2, mode='bilinear', align_corners=False
+            )
+            # Concatenate with the corresponding encoder feature (in reverse order)
+            encoder_feature = encoder_features[num_levels - 1 - level]
+            decoder_features = torch.cat([decoder_features, encoder_feature], dim=1)
+            # Apply the pre-defined residual blocks for this level
+            for res_block in self.decoder_levels[level - start_level]:
+                decoder_features = res_block(decoder_features)
+
+        # Final 1x1 convolution to produce logits
+        logits = self.final_conv(decoder_features)
+        return logits
+
+def manual_kl_divergence(mu_q, sigma_q, mu_p, sigma_p):
+    """Manual KL divergence between two normal distributions."""
+    term1 = torch.log(sigma_p / sigma_q)
+    term2 = (sigma_q**2 + (mu_q - mu_p)**2) / (2 * sigma_p**2)
+    kl = term1 + term2 - 0.5
+    return kl
+        
+class HierarchicalProbUNet(nn.Module):
+    """A Hierarchical Probabilistic U-Net in PyTorch."""
+    def __init__(self,
+                 latent_dims=(1, 1, 1, 1),
+                 channels_per_block=None,
+                 num_classes=2,
+                 down_channels_per_block=None,
+                 activation_fn=F.relu,
+                 convs_per_block=3,
+                 blocks_per_level=3,
+                 loss_kwargs=None,
+                 in_channels=1,
+                 name='HPUNet'):
+        super(HierarchicalProbUNet, self).__init__()
+        self.name = name
+        base_channels = 24
+        default_channels_per_block = (
+            base_channels, 2 * base_channels, 4 * base_channels, 8 * base_channels,
+            8 * base_channels, 8 * base_channels, 8 * base_channels, 8 * base_channels
+        )
+        if channels_per_block is None:
+            channels_per_block = default_channels_per_block
+        if down_channels_per_block is None and channels_per_block is not None:
+            down_channels_per_block = tuple([i // 2 for i in channels_per_block])
+        if loss_kwargs is None:
+            self._loss_kwargs = {
+                'type': 'geco',
+                'top_k_percentage': 0.02,
+                'deterministic_top_k': False,
+                'kappa': 0.05,
+                'decay': 0.99,
+                'rate': 1e-2,
+                'beta': None
             }
-       
-            return f, infodict
-
-
-class HPUNet(nn.Module):
-    def __init__(self, in_ch, chs, latent_num=0, out_ch=1, activation="ReLU", scale_depth=None, kernel_size=None, dilation=None, padding_mode='circular', latent_channels=None, latent_locks=None, conv_dim=2):
-        super().__init__()
-        if latent_locks is None:
-            latent_locks = [False for _ in range(latent_num)]
-        if latent_channels is None:
-            latent_channels = [1 for _ in range(latent_num)]
-        assert len(latent_channels) == latent_num
-        assert latent_num <= len(chs)
-        assert len(scale_depth) == len(chs)
-        assert len(kernel_size) == len(chs)
-        assert len(dilation) == len(chs)
-
-        self.conv_dim = conv_dim
-        self.conv_class = nn.Conv2d if self.conv_dim == 2 else nn.Conv1d
-        decoder_head_in_channels = chs[0] + (0 if latent_num < len(chs) else latent_channels[-1])
-
-        self.encoder_head = ConvBlock(in_ch, chs[0], activation, kernel_size[0], dilation[0], padding_mode='zeros', conv_class=self.conv_class)
-        self.encoder = Encoder(chs, activation, scale_depth, kernel_size, dilation, padding_mode='zeros', conv_class=self.conv_class)
-        self.decoder = Decoder(list(reversed(chs)), latent_num, activation, list(reversed(scale_depth)), list(reversed(kernel_size)), list(reversed(dilation)), padding_mode=padding_mode, latent_channels=latent_channels, latent_locks=latent_locks, conv_class=self.conv_class)
-        self.decoder_head = ScaleBlock(decoder_head_in_channels, out_ch, activation, scale_depth[0], kernel_size[0], dilation[0], padding_mode=padding_mode, conv_class=self.conv_class)
-
-        self.posterior_encoder_head = ConvBlock(in_ch+1, chs[0], activation, kernel_size[0], dilation[0], padding_mode='zeros', conv_class=self.conv_class)
-        self.posterior_encoder = Encoder(chs, activation, scale_depth, kernel_size, dilation, padding_mode='zeros', conv_class=self.conv_class)
-
-    def forward(self, x, y=None, times=1, first_channel_only=True, insert_from_postnet=False):
-        f = self.encoder_head(x)
-        f = self.encoder(f)
-        
-        outs, infodicts = [], []
-
-        if y is None:  # Not Using Posterior Net
-            for _ in range(times):
-                o, infodict = self.decoder(f)
-                o = self.decoder_head(o)
-                outs.append(o)
-                infodicts.append(infodict)
-
-        else:  # Using Posterior Net
-            l = self.posterior_encoder_head(torch.cat([x, y], dim=1))
-            l = self.posterior_encoder(l)
-
-            for _ in range(times):
-                o, infodict = self.decoder(f, l, insert_from_postnet)
-                o = self.decoder_head(o)
-                outs.append(o)
-                infodicts.append(infodict)
-
-        output = torch.stack(outs, dim=1)
-
-        if first_channel_only is True:
-            output = output[:,:,0]
-
-        return output, infodicts
-
-
-# Optimization
-class BetaConstant(nn.Module):
-    def __init__(self, beta):
-        super().__init__()
-        self.beta = beta
-
-    def step(self):
-        return
-
-
-class BetaLinearScheduler(nn.Module):
-    def __init__(self, ascending_steps, constant_steps=0, max_beta=1.0, saturation_step=None):
-        super().__init__()
-        self.ascending_steps = ascending_steps
-        self.constant_steps = constant_steps
-        self.max_beta = max_beta
-        if saturation_step is not None:
-            self.saturation_gap = saturation_step
         else:
-            self.saturation_gap = -1
+            self._loss_kwargs = loss_kwargs
 
-        self.increment = max_beta / ascending_steps
+        # Define submodules
+        self._prior = _HierarchicalCore(
+            latent_dims=latent_dims,
+            channels_per_block=channels_per_block,
+            down_channels_per_block=down_channels_per_block,
+            activation_fn=activation_fn,
+            convs_per_block=convs_per_block,
+            blocks_per_level=blocks_per_level,
+            input_channels=in_channels,
+            name='prior'
+        )
+        self._posterior = _HierarchicalCore(
+            latent_dims=latent_dims,
+            channels_per_block=channels_per_block,
+            down_channels_per_block=down_channels_per_block,
+            activation_fn=activation_fn,
+            convs_per_block=convs_per_block,
+            blocks_per_level=blocks_per_level,
+            input_channels=in_channels+1,
+            name='posterior'
+        )
+        self._f_comb = _StitchingDecoder(
+            latent_dims=latent_dims,
+            channels_per_block=channels_per_block,
+            num_classes=num_classes,
+            down_channels_per_block=down_channels_per_block,
+            activation_fn=activation_fn,
+            convs_per_block=convs_per_block,
+            blocks_per_level=blocks_per_level,
+            name='f_comb'
+        )
 
-        self.beta = 0.0
-        self.state = 'ascend'
-        self.s = 0
+        # Loss-related utilities for GECO
+        if self._loss_kwargs['type'] == 'geco':
+            self._moving_average = MovingAverage(
+                decay=self._loss_kwargs['decay'], differentiable=True
+            )
+            self._lagmul = LagrangeMultiplier(rate=self._loss_kwargs['rate'])
+        self._cache = None
+        self.num_classes = num_classes
 
-    def step(self):
-        if self.state == 'ascend':
-            self.beta += self.increment
-            self.s += 1
-            if self.s == self.ascending_steps:
-                self.state = 'constant'
-                self.s = 0
-        
-        elif self.state == 'constant':
-            self.s += 1
-            if self.s == self.constant_steps:
-                self.state = 'ascend'
-                self.s = 0
-                self.beta = 0.0
-        
-        self.saturation_gap -= 1
-        if self.saturation_gap == 0:
-            self.state = 'saturated'
-            self.beta = self.max_beta
-
-        return
-
-
-# Loss Functions & Utils
-class MSELossWrapper(MSELoss):
-    def __init__(self):
-        super().__init__(reduction='none')
-        self.last_loss = None
-
-    def forward(self, yhat, y, **kwargs):
-        loss = super().forward(yhat, y)
-
-        self.last_loss = {
-            'expanded_loss': loss
-        }
-
-        return loss
-
-
-class ELBOLoss(nn.Module):
-    def __init__(self, reconstruction_loss, beta=None, conv_dim=2):
-        super().__init__()
-        self.conv_dim = conv_dim
-        self.reconstruction_loss = reconstruction_loss
-        
-        if beta is None:
-            beta = BetaConstant(1.0)
-        self.beta_scheduler = beta
-        
-        self.last_loss = None
-
- 
-    def forward(self, yhat, y, kls, **kwargs):
-        rec_loss_before_mean = self.reconstruction_loss(yhat, y, **kwargs).sum( dim=tuple(range(1,self.conv_dim)) )
-        rec_term = rec_loss_before_mean.mean()
-        kl_term = self.beta_scheduler.beta * torch.sum(kls)
-        loss = rec_term + kl_term
-
-        self.last_loss = {
-            'reconstruction_loss_before_mean': rec_loss_before_mean,
-            'reconstruction_term': rec_term,
-            'kl_term': kl_term,
-            'loss': loss,
-            'reconstruction_internal': self.reconstruction_loss.last_loss
-        }
-
-        return loss
-
-
-class GECOLoss(nn.Module):
-    def __init__(self, reconstruction_loss, kappa, decay=0.9, update_rate=0.01, device='cpu', log_inv_function='exp', conv_dim=2):
-        super(GECOLoss, self).__init__()
-        self.conv_dim = conv_dim
-        self.reconstruction_loss = reconstruction_loss
-        
-        self.kappa = kappa
-        self.decay = decay
-        self.update_rate = update_rate
-
-        if log_inv_function == 'exp':
-            self.log_inv_function = torch.exp
-        elif log_inv_function == 'softplus':
-            self.log_inv_function = nn.functional.softplus
-        
-        self.device = device
-
-        self.log_lamda = torch.nn.Parameter(torch.FloatTensor([0.0]), requires_grad=False)
-        self.rec_constraint_ma = None
-
-        self.last_loss = None
-
-
-    def update_rec_constraint_ma(self, cons):
-        if self.rec_constraint_ma is None:
-            self.rec_constraint_ma = torch.FloatTensor([cons]).to(self.device)
+    def _build(self, seg, img):
+        """Builds the computation graph for training."""
+        inputs = (seg, img)
+        if self._cache is not None and all(torch.equal(a, b) for a, b in zip(self._cache, inputs)):
+            return
         else:
-            self.rec_constraint_ma = self.decay * self.rec_constraint_ma.detach() + (1-self.decay) * cons
-    
+            concat_input = torch.cat([seg, img], dim=1)  # Concatenate along channel dimension
+            #print(f'Concat input shape: {concat_input.shape}')
+            self._q_sample = self._posterior(concat_input, mean=False)
+            self._q_sample_mean = self._posterior(concat_input, mean=True)
+            self._p_sample = self._prior(img, mean=False, z_q=None)
+            self._p_sample_z_q = self._prior(img, z_q=self._q_sample['used_latents'])
+            self._p_sample_z_q_mean = self._prior(img, z_q=self._q_sample_mean['used_latents'])
+            self._cache = inputs
 
-    def forward(self, yhat, y, kls, **kwargs):
-        rec_loss_before_mean = self.reconstruction_loss(yhat, y, **kwargs).sum( dim=tuple(range(1,self.conv_dim)) )
-        rec_loss = rec_loss_before_mean.mean()
-        rec_constraint = rec_loss - self.kappa
+    def sample(self, img, mean=False, z_q=None):
+        """Sample a segmentation from the prior, given an input image."""
+        prior_out = self._prior(img, mean, z_q)
+        encoder_features = prior_out['encoder_features']
+        decoder_features = prior_out['decoder_features']
+        return self._f_comb(encoder_features=encoder_features, decoder_features=decoder_features)
 
-        # Update EMA
-        if self.training is True:
-            self.update_rec_constraint_ma(rec_constraint)
+    def reconstruct(self, seg, img, mean=False):
+        """Reconstruct a segmentation using the posterior."""
+        self._build(seg, img)
+        if mean:
+            prior_out = self._p_sample_z_q_mean
+        else:
+            prior_out = self._p_sample_z_q
+        encoder_features = prior_out['encoder_features']
+        decoder_features = prior_out['decoder_features']
+        return self._f_comb(encoder_features=encoder_features, decoder_features=decoder_features)
 
-        # Calculate Loss
-        rec_constraint_ma = rec_constraint + (self.rec_constraint_ma - rec_constraint).detach()
-        lamda = self.log_inv_function(self.log_lamda)
+    def rec_loss(self, seg, img, mask=None, top_k_percentage=None, deterministic=True):
+        """Cross-entropy reconstruction loss employed in the ELBO-/ GECO-objective."""
+        reconstruction = self.reconstruct(seg, img, mean=False)
+        return ce_loss(reconstruction, seg, mask, top_k_percentage, deterministic)
 
-        rec_term = lamda * rec_constraint_ma
-        kl_term = torch.sum(kls)
-        loss = rec_term + kl_term
+    def kl(self, seg, img):
+        """Kullback-Leibler divergence between the posterior and the prior."""
+        self._build(seg, img)
+        posterior_out = self._q_sample
+        prior_out = self._p_sample_z_q
 
-        self.last_loss = {
-            'reconstruction_loss_before_mean': rec_loss_before_mean,
-            'reconstruction_term': rec_term,
-            'kl_term': kl_term,
-            'loss': loss,
-            'reconstruction_internal': self.reconstruction_loss.last_loss
-        }
+        q_dists = posterior_out['distributions']
+        p_dists = prior_out['distributions']
 
-        # Step Lambda
-        if self.training is True:
-            with torch.no_grad():
-                self.log_lamda += self.update_rate * kwargs['lr'] * rec_constraint_ma
+        kl = {}
+        for level, (q, p) in enumerate(zip(q_dists, p_dists)):
+            mu_q, sigma_q = q.mean, q.stddev
+            mu_p, sigma_p = p.mean, p.stddev
+            kl_per_pixel = manual_kl_divergence(mu_q, sigma_q, mu_p, sigma_p)
+            kl_per_instance = torch.sum(kl_per_pixel, dim=[1, 2])
+            kl[level] = torch.mean(kl_per_instance)
+        return kl
 
-        return loss
+    def loss(self, seg, img, mask):
+        """The full training objective, either ELBO or GECO."""
+
+        summaries = {}
+        top_k_percentage = self._loss_kwargs['top_k_percentage']
+        deterministic = self._loss_kwargs['deterministic_top_k']
+            
+        #print(f"Seg shape: {seg.shape} ===== Img shape: {img.shape} ===== Mask shape: {mask.shape}")
+        rec_loss = self.rec_loss(seg, img, mask, top_k_percentage, deterministic)
+
+        mask = None # No mask for now 
+
+        kl_dict = self.kl(seg, img)
+        kl_sum = torch.sum(torch.stack([kl for _, kl in kl_dict.items()], dim=0))
+
+        summaries['rec_loss_mean'] = rec_loss['mean']
+        summaries['rec_loss_sum'] = rec_loss['sum']
+        summaries['kl_sum'] = kl_sum
+        for level, kl in kl_dict.items():
+            summaries[f'kl_{level}'] = kl
+
+        if self._loss_kwargs['type'] == 'elbo':
+            loss = rec_loss['sum'] + self._loss_kwargs['beta'] * kl_sum
+            summaries['elbo_loss'] = loss
+
+        elif self._loss_kwargs['type'] == 'geco':
+            ma_rec_loss = self._moving_average(rec_loss['sum'])
+            mask_sum_per_instance = torch.sum(rec_loss['mask'], dim=1)  # sum over the flattened pixels
+            num_valid_pixels = torch.mean(mask_sum_per_instance)
+            reconstruction_threshold = self._loss_kwargs['kappa'] * num_valid_pixels
+
+            rec_constraint = ma_rec_loss - reconstruction_threshold
+            lagmul = self._lagmul(rec_constraint)
+            loss = lagmul * rec_constraint + kl_sum
+
+            summaries['geco_loss'] = loss
+            summaries['ma_rec_loss_mean'] = ma_rec_loss / num_valid_pixels
+            summaries['num_valid_pixels'] = num_valid_pixels
+            summaries['lagmul'] = lagmul
+        else:
+            raise NotImplementedError(f"Loss type {self._loss_kwargs['type']} not implemented!")
+
+        return dict(supervised_loss=loss, summaries=summaries)
+
+if __name__ == '__main__':
+    hpu_net = HierarchicalProbUNet()
