@@ -142,3 +142,5 @@ $RECYCLE.BIN/
 /datasets
 /ipynb_checkpoints
 runs
+experiments
+note.txt
