@@ -1,6 +1,6 @@
 # Data settings
 data_dir: datasets/LIDC
-batch_size: 4
+batch_size: 8
 num_workers: 2
 
 # Model architecture
@@ -31,7 +31,7 @@ loss_kwargs:
   rate: 0.01
 
 # Training settings
-learning_rate: 0.00001
+learning_rate: 0.0001
 num_epochs: 100
 validation:
   n_batches: 10
