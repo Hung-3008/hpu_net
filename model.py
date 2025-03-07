@@ -5,6 +5,30 @@ from torch.distributions import MultivariateNormal
 from geco import *
 
 
+# class ResBlock(nn.Module):
+#     def __init__(self, input_channels, n_channels, n_down_channels, convs_per_block, activation_fn):
+#         super().__init__()
+#         layers = []
+#         in_channels = input_channels
+#         for i in range(convs_per_block):
+#             out_channels = n_down_channels if i < convs_per_block - 1 else n_channels
+#             conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+#             layers.append(conv)
+#             if i < convs_per_block - 1:
+#                 layers.append(activation_fn())
+#             in_channels = out_channels
+#         self.conv_layers = nn.Sequential(*layers)
+#         self.shortcut = nn.Conv2d(input_channels, n_channels, kernel_size=1) if input_channels != n_channels else nn.Identity()
+#         self.activation = activation_fn()
+
+#     def forward(self, x):
+#         residual = self.shortcut(x)
+#         out = self.conv_layers(x)
+#         out += residual
+#         out = self.activation(out)
+#         return out
+
+
 class ResBlock(nn.Module):
     def __init__(self, input_channels, n_channels, n_down_channels, convs_per_block, activation_fn):
         super().__init__()
@@ -13,12 +37,21 @@ class ResBlock(nn.Module):
         for i in range(convs_per_block):
             out_channels = n_down_channels if i < convs_per_block - 1 else n_channels
             conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+            #nn.init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
+
             layers.append(conv)
+            layers.append(nn.BatchNorm2d(out_channels))  # Add batch norm
             if i < convs_per_block - 1:
                 layers.append(activation_fn())
             in_channels = out_channels
         self.conv_layers = nn.Sequential(*layers)
-        self.shortcut = nn.Conv2d(input_channels, n_channels, kernel_size=1) if input_channels != n_channels else nn.Identity()
+        if input_channels != n_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(input_channels, n_channels, kernel_size=1),
+                nn.BatchNorm2d(n_channels)  # Add batch norm to shortcut
+            )
+        else:
+            self.shortcut = nn.Identity()
         self.activation = activation_fn()
 
     def forward(self, x):
@@ -55,6 +88,7 @@ class _HierarchicalCore(nn.Module):
         self.encoder_levels = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()
         current_channels = input_channels
+
         for level in range(self.num_levels):
             blocks = nn.ModuleList()
             for _ in range(blocks_per_level):
@@ -78,6 +112,7 @@ class _HierarchicalCore(nn.Module):
         self.mu_logsigma_convs = nn.ModuleList()
         self.decoder_upsample_layers = nn.ModuleList()
         self.decoder_levels = nn.ModuleList()
+
         decoder_input_channels = self.channels_per_block[-1]
         for level in range(self.num_latent_levels):
             latent_dim = self.latent_dims[level]
@@ -104,6 +139,17 @@ class _HierarchicalCore(nn.Module):
             decoder_input_channels = self.channels_per_block[self.num_levels - level - 2]
             #print(f'Level {level} decoder_input_channels: {decoder_input_channels}')
 
+            ############################
+            ###  Initialize weights  ###  
+            ############################
+            for conv in self.mu_logsigma_convs:
+                nn.init.normal_(conv.weight, mean=0, std=0.01)
+                nn.init.constant_(conv.bias, 0)
+            for upsample in self.decoder_upsample_layers:
+                conv = upsample[1]
+                nn.init.normal_(conv.weight, mean=0, std=0.01)
+                nn.init.constant_(conv.bias, 0)
+
     def forward(self, inputs, mean=False, z_q=None):
         encoder_features = inputs
         encoder_outputs = []
@@ -114,25 +160,50 @@ class _HierarchicalCore(nn.Module):
         # Encoder forward
         for level in range(self.num_levels):
 
-            for block in self.encoder_levels[level]:
+            for block_idx, block in enumerate(self.encoder_levels[level]):
                 encoder_features = block(encoder_features)
                 #print level and shape of encoder_features
                 #print(f'Level {level} encoder_features shape: {encoder_features.shape}')
+
+                if torch.isnan(encoder_features).any():
+                    print(f"NaN after ResBlock {block_idx} in encoder level {level}")
+                    break
+                #print(f"Max value after ResBlock {block_idx} in encoder level {level}: {encoder_features.max().item()}")
+
+            if torch.isnan(encoder_features).any():
+                break
+
             encoder_outputs.append(encoder_features)
             if level != self.num_levels - 1:
                 encoder_features = self.downsample_layers[level](encoder_features)
+                if torch.isnan(encoder_features).any():
+                    print(f"NaN after downsampling in encoder level {level}")
+                    break
+
+        #print(f"Final encoder output max: {encoder_outputs[-1].max().item()}")
+        if torch.isnan(encoder_outputs[-1]).any():
+            print("NaN in final encoder output")
 
         # Decoder forward
         decoder_features = encoder_outputs[-1]
         for level in range(self.num_latent_levels):
-
+            if torch.isnan(decoder_features).any():
+                print(f"NaN in decoder_features at level {level}")
             mu_logsigma = self.mu_logsigma_convs[level](decoder_features)
             latent_dim = self.latent_dims[level]
-            mu, logsigma = torch.split(mu_logsigma, latent_dim, dim=1)
+            # mu, logsigma = torch.split(mu_logsigma, latent_dim, dim=1)
+            # dist = torch.distributions.Independent(
+            #     torch.distributions.Normal(loc=mu, scale=torch.exp(logsigma)),
+            #     1
+            # )
+
+            mu, logsigma = torch.split(mu_logsigma, latent_dim, dim=1)  # Split convolution output
+            logsigma = torch.clamp(logsigma, min=-10, max=10)  # Add this line
             dist = torch.distributions.Independent(
                 torch.distributions.Normal(loc=mu, scale=torch.exp(logsigma)),
                 1
             )
+
             distributions.append(dist)
             if z_q is not None:
                 z = z_q[level]

@@ -27,6 +27,18 @@ def parse_args():
                         help='CUDA device ID (overrides config if provided)')
     return parser.parse_args()
 
+
+def init_weights(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.normal_(m.weight, mean=0, std=0.01)  # Smaller std than Kaiming
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.constant_(m.weight, 1)
+        nn.init.constant_(m.bias, 0)
+
+
+
 def train_epoch(model, train_loader, optimizer, device):
     """Train the model for one epoch."""
     model.train()
@@ -35,6 +47,11 @@ def train_epoch(model, train_loader, optimizer, device):
         images = images.to(device)
         labels = labels.to(device).unsqueeze(1)  # Add channel dimension
         mask = torch.ones_like(labels).to(device)  # Full mask for simplicity
+        
+        if torch.isnan(images).any() or torch.isnan(labels).any():
+            print("NaN detected in inputs")
+            logging.warning("NaN detected in inputs")
+            continue
 
         optimizer.zero_grad()
         loss_dict = model.loss(labels, images, mask)
@@ -100,6 +117,7 @@ def train(cf):
         in_channels=1  # Assuming grayscale images
     ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=cf['learning_rate'])
+    model.apply(init_weights)
     logging.info("Model and optimizer initialized")
 
     # Training loop
